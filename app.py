@@ -7,7 +7,9 @@ import yfinance as yf
 
 st.set_page_config(page_title="Coin Scanner", layout="wide")
 
-STABLES = {"USDC", "USDT", "DAI", "TUSD", "FDUSD", "USDD", "PYUSD", "USDP", "EUR"}
+# Coins that are never scanned (stablecoins and other non-trading assets)
+STABLES = {"USDC", "USDT", "DAI", "TUSD", "FDUSD", "USDD", "PYUSD", "USDP", "EUR",
+           "USDG", "USD1", "USDE", "USDS", "RLUSD", "XSOXL"}
 
 
 def candles(ex, sym, tf, limit):
@@ -122,7 +124,13 @@ def label(b):
 st.title("Coin Scanner")
 
 c1, c2, c3 = st.columns(3)
-exch = c1.selectbox("Exchange (data source)", ["okx", "kucoin", "gateio", "bybit", "binance"])
+EXCHANGES = {
+    "Binance Futures (USDT-M)": "binanceusdm",
+    "OKX Perpetual (USDT)": "okx",
+    "Bybit Perpetual (USDT)": "bybit",
+}
+exch_name = c1.selectbox("Exchange (data source)", list(EXCHANGES))
+exch = EXCHANGES[exch_name]
 mode = c2.radio("Higher timeframe", ["4H (entry 15m)", "1H (entry 5m)"], horizontal=True)
 top_n = c3.slider("Coins to scan (top by volume)", 20, 150, 50, 10)
 
@@ -136,16 +144,20 @@ if st.button("Scan", type="primary"):
     htf = "4h" if mode.startswith("4H") else "1h"
     entry = "15m" if htf == "4h" else "5m"
     try:
-        ex = getattr(ccxt, exch)({"enableRateLimit": True})
+        cfg = {"enableRateLimit": True}
+        if exch in ("okx", "bybit"):
+            cfg["options"] = {"defaultType": "swap", "defaultSubType": "linear"}
+        ex = getattr(ccxt, exch)(cfg)
         ex.load_markets()
         tick = ex.fetch_tickers()
     except Exception as e:
-        st.error(f"Could not get data from {exch}: {e}. Try another exchange.")
+        st.error(f"Could not get data from {exch_name}: {e}. Try another exchange.")
         st.stop()
 
     pairs = []
     for s, m in ex.markets.items():
-        if (m.get("spot") and m.get("quote") == "USDT" and m.get("active") is not False
+        if (m.get("swap") and m.get("linear") and m.get("quote") == "USDT"
+                and m.get("settle") == "USDT" and m.get("active") is not False
                 and m.get("base") not in STABLES and s in tick):
             pairs.append((float(tick[s].get("quoteVolume") or 0), s))
     syms = [s for _, s in sorted(pairs, reverse=True)[:top_n]]
@@ -161,6 +173,9 @@ if st.button("Scan", type="primary"):
         try:
             dd = candles(ex, s, "1d", 60)
             if len(dd) < 25:
+                continue
+            # skip pegged / stable-like assets (price barely moves over 60 days)
+            if (dd.high.max() - dd.low.min()) / dd.close.iloc[-1] < 0.05:
                 continue
             bias, why = daily_bias(dd)
             hd = candles(ex, s, htf, 120)
@@ -193,7 +208,7 @@ if st.button("Scan", type="primary"):
             if sigs:
                 adj = 0 if dxy is None else (1 if dxy != bias else -1)
                 rows.append({
-                    "Coin": s.replace("/USDT", ""),
+                    "Coin": ex.markets[s]["base"],
                     "Bias": "🟢 Bullish" if bias == "bull" else "🔴 Bearish",
                     "Bias basis": why,
                     "Signals": ", ".join(sigs),
@@ -208,7 +223,7 @@ if st.button("Scan", type="primary"):
             fails += 1
     bar.empty()
     st.session_state["res"] = {
-        "rows": rows, "fails": fails, "n": len(syms), "exch": exch, "htf": htf.upper(),
+        "rows": rows, "fails": fails, "n": len(syms), "exch": exch_name, "htf": htf.upper(),
         "dxy": dxy, "time": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"),
     }
 
