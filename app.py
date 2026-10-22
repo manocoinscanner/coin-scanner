@@ -202,6 +202,7 @@ min_vol = c4.slider("Min 24h volume (million USD)", 1, 500, 20)
 min_score = c5.slider("Minimum score", 1, 8, 3)
 use_dxy = c6.checkbox("Use DXY filter", True)
 only_bn = c6.checkbox("Only coins also on Binance Futures", True)
+only_pd = c6.checkbox("Only OBs on the correct side (bull OB in Discount, bear OB in Premium)", False)
 news = c6.checkbox("High-impact news today (stricter)", False)
 
 htf = "4h" if mode.startswith("4H") else "1h"
@@ -333,12 +334,21 @@ if st.button("Scan", type="primary"):
                         sigs.append("FVG near OB")
                         score += 1
                         break
+                # premium / discount: OB midpoint vs the high-low range of the last 100 closed HTF candles
+                rng_hi = float(closed.high.tail(100).max())
+                rng_lo = float(closed.low.tail(100).min())
+                pos = (((lo + hi) / 2 - rng_lo) / (rng_hi - rng_lo) * 100) if rng_hi > rng_lo else 50.0
+                pd_zone = "Premium" if pos > 50 else "Discount"
+                pd_ok = (ob_side == "bull" and pos <= 50) or (ob_side == "bear" and pos > 50)
                 adj = 0 if dxy is None else (1 if dxy != ob_side else -1)
                 rows.append({
                     "Coin": ex.markets[s]["base"],
                     "Daily bias": "🟢 Bullish" if bias == "bull" else "🔴 Bearish",
                     "Bias basis": why,
                     "OB type": "🟢 Bullish OB" if ob_side == "bull" else "🔴 Bearish OB",
+                    "OB TF": htf.upper(),
+                    "Premium/Discount": f"{pd_zone} ({pos:.0f}%)",
+                    "PD fit": "✅ Correct side" if pd_ok else "⚠️ Wrong side",
                     "Setup": "With bias" if ob_side == bias else "Pullback (against bias)",
                     "Confirmations": ", ".join(sigs) or "-",
                     "OB zone": f"{lo:.6g} – {hi:.6g}",
@@ -347,6 +357,7 @@ if st.button("Scan", type="primary"):
                     "Entry TF": entry,
                     "base": score,
                     "dxy_adj": adj,
+                    "pd_ok": pd_ok,
                 })
         except Exception:
             fails += 1
@@ -372,9 +383,11 @@ if res:
         st.info("No coins had an OB near the price in this scan. Try a larger OB distance or a lower minimum volume.")
     else:
         df["Score"] = df["base"] + (df["dxy_adj"] if use_dxy else 0)
+        if only_pd:
+            df = df[df["pd_ok"]]
         df = df[df["Score"] >= need].sort_values(["Score", "Dist %"], ascending=[False, True])
-        cols = ["Coin", "Score", "Daily bias", "Bias basis", "OB type", "Setup", "Confirmations",
-                "OB zone", "Dist %", "Price", "Entry TF"]
+        cols = ["Coin", "Score", "Daily bias", "Bias basis", "OB type", "OB TF", "Premium/Discount",
+                "PD fit", "Setup", "Confirmations", "OB zone", "Dist %", "Price", "Entry TF"]
         if df.empty:
             st.info("No coins reached the minimum score. Lower it or rescan later.")
         else:
@@ -395,6 +408,9 @@ with st.expander("📖 Terms explained (අර්ථ විස්තර)"):
 - **HTF**: සංඥා හොයන chart එක, 4H හෝ 1H. **Entry TF**: ඔයා chart එකේ බලලා entry ගන්න timeframe එක (4H නම් 15m, 1H නම් 5m). Scanner එක Entry TF එක විශ්ලේෂණය කරන්නේ නැහැ.
 - **OB (Order Block)**: ශක්තිමත් වේගවත් ගමනකට (සාමාන්‍ය candle ප්‍රමාණයේ 1.5 ගුණයකට වඩා විශාල candle එකකට) කලින් තිබුණු අන්තිම ප්‍රතිවිරුද්ධ candle එක. Bullish OB = ඉහළ යන වේගවත් ගමනකට කලින් තිබුණු අන්තිම bearish candle එක. Candle එකක් ඒ කලාපය හරහා close වුණාම අවලංගුයි. Bearish OB = පහළ යන වේගවත් ගමනකට කලින් තිබුණු අන්තිම bullish (ඉහළ) candle එක. Scanner එක බලන්නේ Bullish OB හෝ Bearish OB එකක් (Daily bias එකට ගැළපුණත් නැතත්) මිලට ළඟද කියලායි. දෙකම වෙන වෙනම පෙන්නනවා: **Daily bias** column එකේ දවසේ දිශාව, **OB type** column එකේ OB එකේ වර්ගය. Daily bias එක Bearish වෙලා Bullish OB එකක් ළඟ ඉන්නවා නම් ඒක **Pullback (against bias)** setup එකක්. OB එක bias එකටම ගැළපෙනවා නම් **With bias**.
 - **OB zone**: OB candle එකේ low සිට high දක්වා මිල කලාපය. **Dist %**: දැන් මිල ඒ කලාපයට ඇති දුර (%). `0` = මිල කලාපය ඇතුළේ. `None` හෝ `-` = ළඟ OB එකක් නැහැ.
+- **Premium / Discount**: Dealing range එකක් (මෙහිදී HTF එකේ අන්තිම candles 100ක highest high සිට lowest low දක්වා) මැද 50% ලකුණෙන් (equilibrium) දෙකට බෙදනවා. 50%ට **පහළ** කොටස **Discount** (මිල අඩු කලාපය), 50%ට **ඉහළ** කොටස **Premium** (මිල වැඩි කලාපය). **Premium/Discount** column එකේ පෙන්නන්නේ OB zone එකේ මැද ඒ range එකේ කොයි තැනද කියන එකයි (0% = range එකේ පහළම, 100% = ඉහළම).
+- **PD fit**: Bullish OB එකක් **Discount** එකේ, Bearish OB එකක් **Premium** එකේ තියෙනවා නම් ✅ Correct side. Bullish OB එකක් Premium එකේ හෝ Bearish OB එකක් Discount එකේ තියෙනවා නම් ⚠️ Wrong side. ICT සංකල්පයට අනුව ඒ වගේ OB එකක් අවලංගු වෙන්න (කැඩෙන්න) වැඩි ඉඩක් තියෙනවා. "Only OBs on the correct side" ටික් කළොත් ⚠️ ඒවා ලැයිස්තුවෙන් අයින් වෙනවා.
+- **OB TF**: ඒ OB එක හමුවුණු timeframe එක. දැනට OB හොයන්නේ ඔයා තෝරපු Higher timeframe (4H හෝ 1H) එකේ විතරයි.
 - **Turtle soup**: Bullish නම්, මෑත candles 20ක අඩුම low එක මිල කඩලා (liquidity sweep), ඒත් candle එක ආපහු ඒ මට්ටමට උඩින් close වුණා නම්. Bearish නම් ඒකේ ප්‍රතිවිරුද්ධය (high එක). අන්තිම candles 3 ඇතුළත විතරයි බලන්නේ.
 - **CISD (Change in State of Delivery)**: මෙහි සරල අර්ථ දැක්වීම: Bullish සඳහා, අඛණ්ඩ bearish candles පෙළක් ඇවිත් ඊට පස්සේ candle එකක් ඒ පෙළේ පළමු candle එකේ open එකට උඩින් close වුණා නම්. (Bearish සඳහා ප්‍රතිවිරුද්ධය.) අන්තිම candles 3 ඇතුළත විතරයි බලන්නේ.
 - **Confirmations**: OB එක අනිවාර්යයි (මිලට ළඟ, Max distance ඇතුළත OB එකක් නැති coins ලැයිස්තුවට එන්නේ නැහැ). ඒක ඇත්නම් අමතර තහවුරු කිරීම් විදිහට පෙන්නන්නේ: Turtle soup, CISD, සහ **FVG near OB** (OB එකේ දිශාවටම ගැළපෙන FVG එකක් OB කලාපය ඇතුළේ හෝ ඊට මිලෙන් 1% ඇතුළත තියෙනවා නම්). Turtle soup සහ CISD බලන්නේ **OB එකේ දිශාවටයි** (Bullish OB එකකට bullish ඒවා, Bearish OB එකකට bearish ඒවා).
