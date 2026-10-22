@@ -2,8 +2,8 @@ import datetime as dt
 import re
 
 import ccxt
-import requests
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -12,6 +12,8 @@ st.set_page_config(page_title="Coin Scanner", layout="wide")
 # Coins that are never scanned (stablecoins and other non-trading assets)
 STABLES = {"USDC", "USDT", "DAI", "TUSD", "FDUSD", "USDD", "PYUSD", "USDP", "EUR",
            "USDG", "USD1", "USDE", "USDS", "RLUSD", "XSOXL"}
+TF_MAP = {"4H": "4h", "1H": "1h", "15m": "15m", "5m": "5m"}
+MAX_AGE = 150  # an OB counts only if its structure break happened within the last 150 closed candles
 
 
 def candles(ex, sym, tf, limit):
@@ -19,33 +21,102 @@ def candles(ex, sym, tf, limit):
     return pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "vol"])
 
 
-def find_zones(d):
-    """Unmitigated FVG and OB zones as (kind, side, low, high)."""
-    o, h, l, c = (d[k].values for k in ("open", "high", "low", "close"))
+def swings(d, k=2):
+    """Swing highs/lows as (index, 'H' or 'L', price), strictly alternating."""
+    h, l = d.high.values, d.low.values
     n = len(d)
-    avg_range = pd.Series(h - l).rolling(14, min_periods=5).mean().values
+    raw = []
+    for i in range(k, n - k):
+        is_h = h[i] >= h[i - k:i].max() and h[i] > h[i + 1:i + k + 1].max()
+        is_l = l[i] <= l[i - k:i].min() and l[i] < l[i + 1:i + k + 1].min()
+        if is_h == is_l:
+            continue  # neither, or an outside candle that is both
+        raw.append((i, "H" if is_h else "L", float(h[i] if is_h else l[i])))
+    out = []
+    for i, kind, price in raw:
+        if out and out[-1][1] == kind:
+            if (kind == "H" and price > out[-1][2]) or (kind == "L" and price < out[-1][2]):
+                out[-1] = (i, kind, price)
+            continue
+        out.append((i, kind, price))
+    return out
+
+
+def find_structure_obs(d, k=2):
+    """OBs from market structure, as (side, low, high, break_index).
+    Bullish: down-trend (lower high + lower low). The last lower low must be a liquidity sweep
+             ("torch"): its candle wicks below the previous swing low but CLOSES back above it.
+             Then a candle closes above the last lower high (structure break).
+             Zone = high of the last lower high down to the low of the last lower low.
+    Bearish: the mirror image. The last higher high must sweep the previous swing high
+             (wick above it, close back below it), then a candle closes below the last higher low.
+    A zone dies when a later candle closes beyond it."""
+    h, l, c = d.high.values, d.low.values, d.close.values
+    n = len(d)
+    sw = swings(d, k)
+    found = []
+    for t in range(3, len(sw)):
+        s0, s1, s2, s3 = sw[t - 3], sw[t - 2], sw[t - 1], sw[t]
+        kinds = (s0[1], s1[1], s2[1], s3[1])
+        if kinds == ("H", "L", "H", "L") and s2[2] < s0[2] and s3[2] < s1[2]:
+            # liquidity sweep: the last lower low took out the previous low and closed back above it
+            if not (l[s3[0]] < s1[2] and c[s3[0]] > s1[2]):
+                continue
+            top, bot = s2[2], s3[2]  # last lower high, last lower low
+            for j in range(s3[0] + 1, n):
+                if l[j] < bot:
+                    break  # a deeper low came first, so this is not the last lower low
+                if c[j] > top:
+                    found.append(("bull", bot, top, j))
+                    break
+        elif kinds == ("L", "H", "L", "H") and s2[2] > s0[2] and s3[2] > s1[2]:
+            # liquidity sweep: the last higher high took out the previous high and closed back below it
+            if not (h[s3[0]] > s1[2] and c[s3[0]] < s1[2]):
+                continue
+            bot, top = s2[2], s3[2]  # last higher low, last higher high
+            for j in range(s3[0] + 1, n):
+                if h[j] > top:
+                    break
+                if c[j] < bot:
+                    found.append(("bear", bot, top, j))
+                    break
+    live = []
+    for side, lo, hi, j in found:
+        later = c[j + 1:]
+        if side == "bull" and (later < lo).any():
+            continue
+        if side == "bear" and (later > hi).any():
+            continue
+        live.append((side, float(lo), float(hi), j))
+    return live
+
+
+def find_fvgs(d):
+    """Unfilled fair value gaps as (side, low, high)."""
+    h, l, c = d.high.values, d.low.values, d.close.values
+    n = len(d)
     found = []
     for i in range(2, n):
         if l[i] > h[i - 2]:
-            found.append(("FVG", "bull", h[i - 2], l[i], i))
+            found.append(("bull", h[i - 2], l[i], i))
         if h[i] < l[i - 2]:
-            found.append(("FVG", "bear", h[i], l[i - 2], i))
-        p = i - 1
-        # displacement candle = body at least 1.5x the average range; OB = candle before it
-        if pd.notna(avg_range[p]) and abs(c[i] - o[i]) >= 1.5 * avg_range[p]:
-            if c[i] > o[i] and c[p] < o[p]:
-                found.append(("OB", "bull", l[p], h[p], i))
-            elif c[i] < o[i] and c[p] > o[p]:
-                found.append(("OB", "bear", l[p], h[p], i))
+            found.append(("bear", h[i], l[i - 2], i))
     live = []
-    for kind, side, lo, hi, i in found:
+    for side, lo, hi, i in found:
         later = c[i + 1:]
         if side == "bull" and (later < lo).any():
             continue
         if side == "bear" and (later > hi).any():
             continue
-        live.append((kind, side, float(lo), float(hi)))
+        live.append((side, float(lo), float(hi)))
     return live
+
+
+def key_zones(d, k=2):
+    """Daily key levels for Rule 2: FVGs and structure OBs as (kind, side, low, high)."""
+    z = [("FVG", s, lo, hi) for s, lo, hi in find_fvgs(d)]
+    z += [("OB", s, lo, hi) for s, lo, hi, _ in find_structure_obs(d, k)]
+    return z
 
 
 def daily_bias(d):
@@ -54,7 +125,7 @@ def daily_bias(d):
     # Rule 1: last closed day vs the day before it
     bias = "bull" if closed.close.iloc[-1] > closed.close.iloc[-2] else "bear"
     # Rule 2: rejection wick at a key level (FVG / OB) flips the bias
-    zones = find_zones(closed.iloc[:-1])
+    zones = key_zones(closed.iloc[:-1].reset_index(drop=True))
     k = closed.iloc[-1]
     o, h, l, c = k.open, k.high, k.low, k.close
     body, rg = abs(c - o), h - l
@@ -71,13 +142,13 @@ def daily_bias(d):
     return bias, "Rule 1"
 
 
-def turtle_soup(d, bias, look=20, recent=3):
+def turtle_soup(d, side, look=20, recent=3):
     h, l, c = d.high.values, d.low.values, d.close.values
     n = len(d)
     for k in range(n - recent, n):
         if k - look < 0:
             continue
-        if bias == "bull":
+        if side == "bull":
             ref = l[k - look:k].min()
             if l[k] < ref and c[k] > ref:
                 return True
@@ -88,10 +159,10 @@ def turtle_soup(d, bias, look=20, recent=3):
     return False
 
 
-def cisd(d, bias, recent=3, scan=12):
+def cisd(d, side, recent=3, scan=12):
     o, c = d.open.values, d.close.values
     n = len(d)
-    opposing = (c < o) if bias == "bull" else (c > o)
+    opposing = (c < o) if side == "bull" else (c > o)
     for e in range(n - 2, max(n - scan, 1) - 1, -1):
         if opposing[e] and not opposing[e + 1]:
             s = e
@@ -99,61 +170,61 @@ def cisd(d, bias, recent=3, scan=12):
                 s -= 1
             run_open = o[s]
             for j in range(e + 1, n):
-                broke = c[j] > run_open if bias == "bull" else c[j] < run_open
+                broke = c[j] > run_open if side == "bull" else c[j] < run_open
                 if broke:
                     return j >= n - recent
             return False
     return False
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def dxy_info():
-    """Dollar index daily bias (Rule 1) and last closed-day % change."""
-    try:
-        d = yf.download("DX-Y.NYB", period="3mo", interval="1d", progress=False, auto_adjust=True)
-        if isinstance(d.columns, pd.MultiIndex):
-            d.columns = d.columns.get_level_values(0)
-        d = d.dropna(subset=["Close"])
-        if d.index[-1].date() >= dt.datetime.now(dt.timezone.utc).date():
-            d = d.iloc[:-1]
-        last, prev = float(d["Close"].iloc[-1]), float(d["Close"].iloc[-2])
-        return {"bias": "bull" if last > prev else "bear", "pct": (last / prev - 1) * 100}
-    except Exception:
-        return None
-
-
-def dxy_bias():
-    info = dxy_info()
-    return info["bias"] if info else None
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def btc_overview(exch, htf):
-    """BTC daily bias plus higher-timeframe signals in the bias direction."""
-    cfg = {"enableRateLimit": True}
-    if exch in ("okx", "bybit"):
-        cfg["options"] = {"defaultType": "swap", "defaultSubType": "linear"}
-    ex = getattr(ccxt, exch)(cfg)
-    sym = "BTC/USDT:USDT"
-    dd = candles(ex, sym, "1d", 60)
-    hd = candles(ex, sym, htf, 120)
-    bias, why = daily_bias(dd)
-    done = dd.iloc[:-1]
-    day_pct = (done.close.iloc[-1] / done.close.iloc[-2] - 1) * 100
-    price = float(hd.close.iloc[-1])
-    today_pct = (price / float(dd.open.iloc[-1]) - 1) * 100
+def analyze_tf(hd, bias, prox, k):
+    """Best OB (bullish or bearish) near the current price on one timeframe, or None.
+    hd = candles including the current unfinished one."""
     closed = hd.iloc[:-1].reset_index(drop=True)
+    price = float(hd.close.iloc[-1])
+    n = len(closed)
+    best = None
+    for side, lo, hi, j in find_structure_obs(closed, k):
+        if j < n - MAX_AGE:
+            continue
+        if (side == "bull" and price < lo) or (side == "bear" and price > hi):
+            continue  # price is already beyond the zone
+        if lo <= price <= hi:
+            dist = 0.0
+        elif price > hi:
+            dist = (price - hi) / price * 100
+        else:
+            dist = (lo - price) / price * 100
+        key = (dist, 0 if side == bias else 1, -j)
+        if dist <= prox and (best is None or key < best[0]):
+            best = (key, side, lo, hi, j)
+    if best is None:
+        return None
+    (dist, _, _), side, lo, hi, j = best
+    score = 3 if dist == 0 else 2
     sigs = []
-    if turtle_soup(closed, bias):
+    if turtle_soup(closed, side):
         sigs.append("Turtle soup")
-    if cisd(closed, bias):
+        score += 2
+    if cisd(closed, side):
         sigs.append("CISD")
-    for kind, side, lo, hi in find_zones(closed.tail(100)):
-        if kind == "OB" and side == bias and lo * 0.97 <= price <= hi * 1.03:
-            sigs.append(f"OB {lo:.0f}-{hi:.0f}")
+        score += 2
+    for fside, flo, fhi in find_fvgs(closed.tail(100)):  # same-side FVG overlapping/near the OB
+        if fside != side:
+            continue
+        gap = 0.0 if (fhi >= lo and flo <= hi) else (flo - hi if flo > hi else lo - fhi)
+        if gap / price * 100 <= 1.0:
+            sigs.append("FVG near OB")
+            score += 1
             break
-    return {"bias": bias, "why": why, "day_pct": day_pct, "today_pct": today_pct,
-            "price": price, "sigs": sigs}
+    # premium / discount: OB midpoint vs the high-low range of the last 100 closed candles
+    rng_hi = float(closed.high.tail(100).max())
+    rng_lo = float(closed.low.tail(100).min())
+    pos = (((lo + hi) / 2 - rng_lo) / (rng_hi - rng_lo) * 100) if rng_hi > rng_lo else 50.0
+    pd_ok = (side == "bull" and pos <= 50) or (side == "bear" and pos > 50)
+    return {"side": side, "lo": lo, "hi": hi, "dist": dist, "brk_ago": n - 1 - j, "sigs": sigs,
+            "score": score, "pd_zone": "Premium" if pos > 50 else "Discount", "pos": pos,
+            "pd_ok": pd_ok, "price": price}
 
 
 def norm(base):
@@ -179,48 +250,99 @@ def binance_futures_bases():
     return sorted(out)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def dxy_info():
+    """Dollar index daily bias (Rule 1) and last closed-day % change."""
+    try:
+        d = yf.download("DX-Y.NYB", period="3mo", interval="1d", progress=False, auto_adjust=True)
+        if isinstance(d.columns, pd.MultiIndex):
+            d.columns = d.columns.get_level_values(0)
+        d = d.dropna(subset=["Close"])
+        if d.index[-1].date() >= dt.datetime.now(dt.timezone.utc).date():
+            d = d.iloc[:-1]
+        last, prev = float(d["Close"].iloc[-1]), float(d["Close"].iloc[-2])
+        return {"bias": "bull" if last > prev else "bear", "pct": (last / prev - 1) * 100}
+    except Exception:
+        return None
+
+
+def dxy_bias():
+    info = dxy_info()
+    return info["bias"] if info else None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def btc_overview(exch, tfs, k, prox):
+    """BTC daily bias plus the nearest OB on each selected timeframe."""
+    cfg = {"enableRateLimit": True}
+    if exch in ("okx", "bybit"):
+        cfg["options"] = {"defaultType": "swap", "defaultSubType": "linear"}
+    ex = getattr(ccxt, exch)(cfg)
+    sym = "BTC/USDT:USDT"
+    dd = candles(ex, sym, "1d", 60)
+    bias, why = daily_bias(dd)
+    done = dd.iloc[:-1]
+    day_pct = (done.close.iloc[-1] / done.close.iloc[-2] - 1) * 100
+    price = float(dd.close.iloc[-1])
+    today_pct = (price / float(dd.open.iloc[-1]) - 1) * 100
+    per_tf = {}
+    for name in tfs:
+        per_tf[name] = analyze_tf(candles(ex, sym, TF_MAP[name], 300), bias, prox, k)
+    return {"bias": bias, "why": why, "day_pct": day_pct, "today_pct": today_pct,
+            "price": price, "tfs": per_tf}
+
+
 def label(b):
     return {"bull": "Bullish", "bear": "Bearish"}.get(b, "unavailable")
 
 
 st.title("Coin Scanner")
 
-c1, c2, c3 = st.columns(3)
 EXCHANGES = {
     "Binance Futures (USDT-M)": "binanceusdm",
     "OKX Perpetual (USDT)": "okx",
     "Bybit Perpetual (USDT)": "bybit",
 }
+
+c1, c2, c3 = st.columns(3)
 exch_name = c1.selectbox("Exchange (data source)", list(EXCHANGES))
 exch = EXCHANGES[exch_name]
-mode = c2.radio("Higher timeframe", ["4H (entry 15m)", "1H (entry 5m)"], horizontal=True)
+tf_choice = c2.multiselect("OB timeframe(s)", list(TF_MAP), default=["4H"])
 top_n = c3.slider("Coins to scan (top by volume)", 20, 150, 50, 10)
 
 c4, c5, c6 = st.columns(3)
 prox = c4.slider("Max distance to OB zone (%)", 0.5, 10.0, 3.0, 0.5)
 min_vol = c4.slider("Min 24h volume (million USD)", 1, 500, 20)
-min_score = c5.slider("Minimum score", 1, 8, 3)
+min_score = c5.slider("Minimum score", 1, 9, 3)
+swing_k = c5.slider("Swing sensitivity (candles on each side)", 1, 5, 2)
 use_dxy = c6.checkbox("Use DXY filter", True)
 only_bn = c6.checkbox("Only coins also on Binance Futures", True)
 only_pd = c6.checkbox("Only OBs on the correct side (bull OB in Discount, bear OB in Premium)", False)
 news = c6.checkbox("High-impact news today (stricter)", False)
-
-htf = "4h" if mode.startswith("4H") else "1h"
 
 st.subheader("Market overview: BTC + Dollar index")
 o1, o2, o3 = st.columns(3)
 btc = None
 dxy_i = dxy_info()
 try:
-    btc = btc_overview(exch, htf)
+    btc = btc_overview(exch, tuple(tf_choice), swing_k, prox)
 except Exception as e:
     o1.warning(f"BTC overview not available from {exch_name}: {e}")
 if btc:
     o1.metric("BTC daily bias", "🟢 Bullish" if btc["bias"] == "bull" else "🔴 Bearish",
               f"{btc['day_pct']:+.2f}% last closed day")
+    lines = []
+    for name, r in btc["tfs"].items():
+        if r:
+            txt = f"{name}: {'Bullish' if r['side'] == 'bull' else 'Bearish'} OB {r['lo']:.0f}-{r['hi']:.0f} ({r['dist']:.2f}% away)"
+            if r["sigs"]:
+                txt += " + " + ", ".join(r["sigs"])
+        else:
+            txt = f"{name}: no OB near price"
+        lines.append(txt)
     o1.caption(
-        f"{btc['why']} | Price {btc['price']:,.1f} | today so far {btc['today_pct']:+.2f}%. "
-        f"{htf.upper()} signals in the bias direction: {', '.join(btc['sigs']) or 'none right now'}."
+        f"{btc['why']} | Price {btc['price']:,.1f} | today so far {btc['today_pct']:+.2f}%"
+        + (" | " + " | ".join(lines) if lines else "")
     )
 if dxy_i:
     o2.metric("Dollar index (DXY) daily bias",
@@ -238,8 +360,9 @@ if btc and dxy_i:
         o3.info("BTC සහ DXY සංඥා මිශ්‍රයි (එකිනෙකට ගැළපෙන්නේ නැහැ). ප්‍රවේශම් වන්න, ලකුණු අඩු coins මගහරින්න.")
 
 if st.button("Scan", type="primary"):
-    htf = "4h" if mode.startswith("4H") else "1h"
-    entry = "15m" if htf == "4h" else "5m"
+    if not tf_choice:
+        st.warning("Select at least one OB timeframe.")
+        st.stop()
     try:
         cfg = {"enableRateLimit": True}
         if exch in ("okx", "bybit"):
@@ -278,7 +401,7 @@ if st.button("Scan", type="primary"):
         pairs = [p for p in pairs if p[0] >= min_vol * 1_000_000]
     syms = [s for _, s in sorted(pairs, reverse=True)[:top_n]]
     if not syms:
-        st.error("No USDT pairs found on this exchange. Try another one.")
+        st.error("No coins matched the filters. Lower the minimum volume or untick the Binance filter.")
         st.stop()
 
     dxy = dxy_bias()
@@ -294,84 +417,45 @@ if st.button("Scan", type="primary"):
             if (dd.high.max() - dd.low.min()) / dd.close.iloc[-1] < 0.05:
                 continue
             bias, why = daily_bias(dd)
-            hd = candles(ex, s, htf, 120)
-            if len(hd) < 40:
-                continue
-            closed = hd.iloc[:-1].reset_index(drop=True)
-            price = float(hd.close.iloc[-1])
-            sigs, score = [], 0
-            # nearest unmitigated OB (bullish OR bearish) around the current price
-            zones = find_zones(closed.tail(100))
-            best = None
-            for kind, side, lo, hi in zones:
-                if kind != "OB":
+            for name in tf_choice:
+                hd = candles(ex, s, TF_MAP[name], 300)
+                if len(hd) < 60:
                     continue
-                if (side == "bull" and price < lo) or (side == "bear" and price > hi):
-                    continue  # price is already beyond the zone
-                if lo <= price <= hi:
-                    dist = 0.0
-                elif price > hi:
-                    dist = (price - hi) / price * 100
-                else:
-                    dist = (lo - price) / price * 100
-                key = (dist, 0 if side == bias else 1)
-                if dist <= prox and (best is None or key < best[0]):
-                    best = (key, side, lo, hi)
-            if best:  # OB is mandatory; the rest are extra confirmations that add score
-                (dist, _), ob_side, lo, hi = best
-                score += 3 if dist == 0 else 2
-                if turtle_soup(closed, ob_side):
-                    sigs.append("Turtle soup")
-                    score += 2
-                if cisd(closed, ob_side):
-                    sigs.append("CISD")
-                    score += 2
-                for kind, side, flo, fhi in zones:  # same-side FVG overlapping/near the OB
-                    if kind != "FVG" or side != ob_side:
-                        continue
-                    gap = 0.0 if (fhi >= lo and flo <= hi) else (flo - hi if flo > hi else lo - fhi)
-                    if gap / price * 100 <= 1.0:
-                        sigs.append("FVG near OB")
-                        score += 1
-                        break
-                # premium / discount: OB midpoint vs the high-low range of the last 100 closed HTF candles
-                rng_hi = float(closed.high.tail(100).max())
-                rng_lo = float(closed.low.tail(100).min())
-                pos = (((lo + hi) / 2 - rng_lo) / (rng_hi - rng_lo) * 100) if rng_hi > rng_lo else 50.0
-                pd_zone = "Premium" if pos > 50 else "Discount"
-                pd_ok = (ob_side == "bull" and pos <= 50) or (ob_side == "bear" and pos > 50)
-                adj = 0 if dxy is None else (1 if dxy != ob_side else -1)
+                r = analyze_tf(hd, bias, prox, swing_k)
+                if not r:
+                    continue  # no OB near price on this timeframe
+                adj = 0 if dxy is None else (1 if dxy != r["side"] else -1)
                 rows.append({
                     "Coin": ex.markets[s]["base"],
                     "Daily bias": "🟢 Bullish" if bias == "bull" else "🔴 Bearish",
                     "Bias basis": why,
-                    "OB type": "🟢 Bullish OB" if ob_side == "bull" else "🔴 Bearish OB",
-                    "OB TF": htf.upper(),
-                    "Premium/Discount": f"{pd_zone} ({pos:.0f}%)",
-                    "PD fit": "✅ Correct side" if pd_ok else "⚠️ Wrong side",
-                    "Setup": "With bias" if ob_side == bias else "Pullback (against bias)",
-                    "Confirmations": ", ".join(sigs) or "-",
-                    "OB zone": f"{lo:.6g} – {hi:.6g}",
-                    "Dist %": round(dist, 2),
-                    "Price": price,
-                    "Entry TF": entry,
-                    "base": score,
+                    "OB type": "🟢 Bullish OB" if r["side"] == "bull" else "🔴 Bearish OB",
+                    "OB TF": name,
+                    "Premium/Discount": f"{r['pd_zone']} ({r['pos']:.0f}%)",
+                    "PD fit": "✅ Correct side" if r["pd_ok"] else "⚠️ Wrong side",
+                    "Setup": "With bias" if r["side"] == bias else "Pullback (against bias)",
+                    "Confirmations": ", ".join(r["sigs"]) or "-",
+                    "OB zone": f"{r['lo']:.6g} – {r['hi']:.6g}",
+                    "Dist %": round(r["dist"], 2),
+                    "Break (candles ago)": r["brk_ago"],
+                    "Price": r["price"],
+                    "base": r["score"],
                     "dxy_adj": adj,
-                    "pd_ok": pd_ok,
+                    "pd_ok": r["pd_ok"],
                 })
         except Exception:
             fails += 1
     bar.empty()
     st.session_state["res"] = {
-        "rows": rows, "fails": fails, "n": len(syms), "exch": exch_name, "htf": htf.upper(),
-        "bn": bn is not None,
-        "dxy": dxy, "time": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"),
+        "rows": rows, "fails": fails, "n": len(syms), "exch": exch_name, "tfs": list(tf_choice),
+        "bn": bn is not None, "dxy": dxy,
+        "time": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"),
     }
 
 res = st.session_state.get("res")
 if res:
     st.caption(
-        f"Scanned {res['n']} coins on {res['exch']} at {res['time']} UTC | HTF {res['htf']} | "
+        f"Scanned {res['n']} coins on {res['exch']} at {res['time']} UTC | OB timeframes: {', '.join(res['tfs'])} | "
         f"DXY daily bias: {label(res['dxy'])} | Binance Futures filter: {'on' if res['bn'] else 'off'} | "
         f"failed: {res['fails']}"
     )
@@ -380,14 +464,14 @@ if res:
     need = min_score + (1 if news else 0)
     df = pd.DataFrame(res["rows"])
     if df.empty:
-        st.info("No coins had an OB near the price in this scan. Try a larger OB distance or a lower minimum volume.")
+        st.info("No coins had an OB near the price in this scan. Try a larger OB distance, more timeframes, or a lower minimum volume.")
     else:
         df["Score"] = df["base"] + (df["dxy_adj"] if use_dxy else 0)
         if only_pd:
             df = df[df["pd_ok"]]
         df = df[df["Score"] >= need].sort_values(["Score", "Dist %"], ascending=[False, True])
         cols = ["Coin", "Score", "Daily bias", "Bias basis", "OB type", "OB TF", "Premium/Discount",
-                "PD fit", "Setup", "Confirmations", "OB zone", "Dist %", "Price", "Entry TF"]
+                "PD fit", "Setup", "Confirmations", "OB zone", "Dist %", "Break (candles ago)", "Price"]
         if df.empty:
             st.info("No coins reached the minimum score. Lower it or rescan later.")
         else:
@@ -397,43 +481,48 @@ with st.expander("📖 Terms explained (අර්ථ විස්තර)"):
     st.markdown(
         """
 ### 1. Daily Bias (දවසේ දිශාව)
-- **Bias**: Daily chart එකෙන් තීරණය කරන දිශාව. **Bullish 🟢** = ඉහළ යන්න වැඩි ඉඩක් (long setups හොයන්න), **Bearish 🔴** = පහළ යන්න වැඩි ඉඩක් (short setups හොයන්න). මේක අනාවැකියක් නෙවෙයි, ඔයාගේ rules වලට අනුව හදන දිශා නිගමනයක් විතරයි.
+- **Bias**: Daily chart එකෙන් තීරණය කරන දිශාව. **Bullish 🟢** = ඉහළ යන්න වැඩි ඉඩක්, **Bearish 🔴** = පහළ යන්න වැඩි ඉඩක්. මේක අනාවැකියක් නෙවෙයි, ඔයාගේ rules වලට අනුව හදන දිශා නිගමනයක් විතරයි.
 - **Rule 1 (close එකට close)**: අන්තිමට වැසුණු daily candle එක, ඊට කලින් දවසේ close එකට වඩා ඉහළින් close වුණා නම් Bullish, පහළින් close වුණා නම් Bearish.
-- **Rule 2 (key level rejection)**: අන්තිම daily candle එකේ දිග wick එකක් (wick එක body එකට වඩා දෙගුණයක් හෝ වැඩි, candle එකෙන් අඩකට වඩා) key level එකක (FVG හෝ OB) ළඟ හැදුණා නම්, එතැනින් market එක හැරුණා කියලා සලකලා Bias එක ඒ දිශාවට වෙනස් කරනවා (Rule 1 අභිබවා). පහළ wick + bullish zone = Bullish, ඉහළ wick + bearish zone = Bearish.
+- **Rule 2 (key level rejection)**: අන්තිම daily candle එකේ දිග wick එකක් (wick එක body එකට වඩා දෙගුණයක් හෝ වැඩි, candle එකෙන් අඩකට වඩා) key level එකක (Daily FVG හෝ Daily OB) ළඟ හැදුණා නම්, එතැනින් market එක හැරුණා කියලා සලකලා Bias එක ඒ දිශාවට වෙනස් කරනවා (Rule 1 අභිබවා). පහළ wick + bullish zone = Bullish, ඉහළ wick + bearish zone = Bearish.
 - **Bias basis** (table එකේ column එක): Bias එක ආවේ Rule 1 එකෙන්ද Rule 2 එකෙන්ද කියලා පෙන්නනවා.
-- **Key level**: මිල කලින් ප්‍රතිචාර දක්වපු වැදගත් මිල කලාපයක්. මෙහිදී FVG සහ OB.
-- **FVG (Fair Value Gap)**: candle 3ක් අතරේ, මැද candle එක වේගයෙන් ගිය නිසා පළමු candle එකේ high එකයි තුන්වැනි candle එකේ low එකයි අතර හිස් ඉඩක් ඉතිරි වීම. මිල ආපහු ඒක පුරවන්න එන්න ඉඩ තියෙනවා කියලා සලකනවා. Candle එකක් ඒ කලාපය හරහා close වුණාම ඒක අවලංගුයි.
+- **FVG (Fair Value Gap)**: candle 3ක් අතරේ, මැද candle එක වේගයෙන් ගිය නිසා පළමු candle එකේ high එකයි තුන්වැනි candle එකේ low එකයි අතර හිස් ඉඩක් ඉතිරි වීම (bearish නම් අනිත් පැත්ත). Candle එකක් ඒ කලාපය හරහා close වුණාම ඒක අවලංගුයි.
 
-### 2. Higher timeframe (HTF) සංඥා
-- **HTF**: සංඥා හොයන chart එක, 4H හෝ 1H. **Entry TF**: ඔයා chart එකේ බලලා entry ගන්න timeframe එක (4H නම් 15m, 1H නම් 5m). Scanner එක Entry TF එක විශ්ලේෂණය කරන්නේ නැහැ.
-- **OB (Order Block)**: ශක්තිමත් වේගවත් ගමනකට (සාමාන්‍ය candle ප්‍රමාණයේ 1.5 ගුණයකට වඩා විශාල candle එකකට) කලින් තිබුණු අන්තිම ප්‍රතිවිරුද්ධ candle එක. Bullish OB = ඉහළ යන වේගවත් ගමනකට කලින් තිබුණු අන්තිම bearish candle එක. Candle එකක් ඒ කලාපය හරහා close වුණාම අවලංගුයි. Bearish OB = පහළ යන වේගවත් ගමනකට කලින් තිබුණු අන්තිම bullish (ඉහළ) candle එක. Scanner එක බලන්නේ Bullish OB හෝ Bearish OB එකක් (Daily bias එකට ගැළපුණත් නැතත්) මිලට ළඟද කියලායි. දෙකම වෙන වෙනම පෙන්නනවා: **Daily bias** column එකේ දවසේ දිශාව, **OB type** column එකේ OB එකේ වර්ගය. Daily bias එක Bearish වෙලා Bullish OB එකක් ළඟ ඉන්නවා නම් ඒක **Pullback (against bias)** setup එකක්. OB එක bias එකටම ගැළපෙනවා නම් **With bias**.
-- **OB zone**: OB candle එකේ low සිට high දක්වා මිල කලාපය. **Dist %**: දැන් මිල ඒ කලාපයට ඇති දුර (%). `0` = මිල කලාපය ඇතුළේ. `None` හෝ `-` = ළඟ OB එකක් නැහැ.
-- **Premium / Discount**: Dealing range එකක් (මෙහිදී HTF එකේ අන්තිම candles 100ක highest high සිට lowest low දක්වා) මැද 50% ලකුණෙන් (equilibrium) දෙකට බෙදනවා. 50%ට **පහළ** කොටස **Discount** (මිල අඩු කලාපය), 50%ට **ඉහළ** කොටස **Premium** (මිල වැඩි කලාපය). **Premium/Discount** column එකේ පෙන්නන්නේ OB zone එකේ මැද ඒ range එකේ කොයි තැනද කියන එකයි (0% = range එකේ පහළම, 100% = ඉහළම).
-- **PD fit**: Bullish OB එකක් **Discount** එකේ, Bearish OB එකක් **Premium** එකේ තියෙනවා නම් ✅ Correct side. Bullish OB එකක් Premium එකේ හෝ Bearish OB එකක් Discount එකේ තියෙනවා නම් ⚠️ Wrong side. ICT සංකල්පයට අනුව ඒ වගේ OB එකක් අවලංගු වෙන්න (කැඩෙන්න) වැඩි ඉඩක් තියෙනවා. "Only OBs on the correct side" ටික් කළොත් ⚠️ ඒවා ලැයිස්තුවෙන් අයින් වෙනවා.
-- **OB TF**: ඒ OB එක හමුවුණු timeframe එක. දැනට OB හොයන්නේ ඔයා තෝරපු Higher timeframe (4H හෝ 1H) එකේ විතරයි.
-- **Turtle soup**: Bullish නම්, මෑත candles 20ක අඩුම low එක මිල කඩලා (liquidity sweep), ඒත් candle එක ආපහු ඒ මට්ටමට උඩින් close වුණා නම්. Bearish නම් ඒකේ ප්‍රතිවිරුද්ධය (high එක). අන්තිම candles 3 ඇතුළත විතරයි බලන්නේ.
-- **CISD (Change in State of Delivery)**: මෙහි සරල අර්ථ දැක්වීම: Bullish සඳහා, අඛණ්ඩ bearish candles පෙළක් ඇවිත් ඊට පස්සේ candle එකක් ඒ පෙළේ පළමු candle එකේ open එකට උඩින් close වුණා නම්. (Bearish සඳහා ප්‍රතිවිරුද්ධය.) අන්තිම candles 3 ඇතුළත විතරයි බලන්නේ.
-- **Confirmations**: OB එක අනිවාර්යයි (මිලට ළඟ, Max distance ඇතුළත OB එකක් නැති coins ලැයිස්තුවට එන්නේ නැහැ). ඒක ඇත්නම් අමතර තහවුරු කිරීම් විදිහට පෙන්නන්නේ: Turtle soup, CISD, සහ **FVG near OB** (OB එකේ දිශාවටම ගැළපෙන FVG එකක් OB කලාපය ඇතුළේ හෝ ඊට මිලෙන් 1% ඇතුළත තියෙනවා නම්). Turtle soup සහ CISD බලන්නේ **OB එකේ දිශාවටයි** (Bullish OB එකකට bullish ඒවා, Bearish OB එකකට bearish ඒවා).
+### 2. OB (ඔයාගේ නිර්වචනය)
+- **Swing high / Swing low**: candle එකක high එක, ඊට කලින් සහ පස්සේ candles (Swing sensitivity ගණන) වල high වලට වඩා උසස් නම් ඒක swing high. low එක ඒවායේ low වලට වඩා පහළ නම් swing low. Sensitivity එක අඩු කළොත් කුඩා swings ගොඩක් හමුවෙනවා, වැඩි කළොත් විශාල swings විතරයි.
+- **Liquidity sweep ("torch") — අනිවාර්යයි**: OB එකක් හැදෙන්න නම් අන්තිම Lower Low / Higher High එක හැදෙන candle එක කලින් swing low / high එක (liquidity) wick එකෙන් කඩලා, ඒත් ආපහු ඒ මට්ටමට ඇතුළතින් **close** වෙන්න ඕන. torch එකක් වගේ spike එකක් ගහලා හැරෙනවා. මේක නැති OB ලැයිස්තුවට එන්නේ නැහැ.
+- **Bullish OB**: මුලින් down trend එකක් (Lower High සහ Lower Low) තියෙන්න ඕන. අන්තිම **Lower Low (LL)** එක කලින් swing low එක sweep කරලා ආපහු ඒකට උඩින් close වෙන්න ඕන. ඊට පස්සේ candle එකක් අන්තිම **Lower High (LH)** එකේ high එකට උඩින් **close** වුණාම (structure break එක, "shot" එක), **LH එකේ high එකේ සිට LL එකේ low එක දක්වා මුළු පරාසයම** OB zone එක.
+- **Bearish OB**: ඒකේ ප්‍රතිවිරුද්ධය. Up trend එකක් (Higher High සහ Higher Low) තියෙනවා. අන්තිම Higher High එක කලින් swing high එක sweep කරලා ආපහු ඒකට යටින් close වෙන්න ඕන. ඊට පස්සේ candle එකක් අන්තිම **Higher Low** එකේ low එකට යටින් close වුණාම, ඒ Higher Low එකේ low එකේ සිට Higher High එකේ high එක දක්වා පරාසය OB zone එක.
+- **අවලංගු වීම**: Bullish OB එකට යටින් candle එකක් close වුණාම, Bearish OB එකට උඩින් close වුණාම ඒ OB එක අවලංගුයි. ඒ වගේම structure break එක අන්තිම candles 150 ඇතුළත විතරයි ගන්නේ.
+- **OB timeframe(s)**: 4H, 1H, 15m, 5m අතරින් එකක් හෝ කිහිපයක් තෝරන්න පුළුවන්. කිහිපයක් තෝරුවොත් ඒ ඒ timeframe එකට වෙනම row එකක් එනවා. Daily එකේ OB scan කරන්නේ නැහැ (Daily එක Bias සඳහා විතරයි, Rule 2 වලට Daily FVG/OB key level විදිහට පාවිච්චි වෙනවා).
+- **OB zone**: OB එකේ low සිට high දක්වා මිල කලාපය. **Dist %**: දැන් මිල ඒ කලාපයට ඇති දුර (%). `0` = මිල කලාපය ඇතුළේ. **Break (candles ago)**: structure break එක හැදිලා candles කීයක්ද (අඩු = අලුත්).
+- **OB type**: Bullish OB ද Bearish OB ද කියන එක. Daily bias එක Bearish වෙලා Bullish OB එකක් ළඟ ඉන්නවා නම් ඒක **Pullback (against bias)** setup එකක්. OB එක bias එකටම ගැළපෙනවා නම් **With bias** (Setup column එක).
 
-### 3. Score (ලකුණු)
-- **Score**: OB (zone එකට ළඟ) +2, මිල zone එක ඇතුළේ නම් +3. Turtle soup +2, CISD +2, FVG near OB +1. DXY filter එක on නම්: OB එකේ දිශාවට (Bullish OB = long, Bearish OB = short) DXY ගැළපෙනවා නම් (උදා: Bullish OB, DXY Bearish) +1, ගැළපෙන්නේ නැත්නම් -1. ලකුණු වැඩි = ඔයාගේ rules වලට වැඩියෙන් ගැළපෙනවා. ඒත් ජයග්‍රහණයක් සහතික කරන්නේ නැහැ. With bias සහ Pullback setups වලට වෙනම ලකුණු නැහැ, ඒවා Setup column එකෙන් වෙන්කරලා බලන්න.
+### 3. Premium / Discount
+- **Premium / Discount**: ඒ OB එකේම timeframe එකේ අන්තිම candles 100ක highest high සිට lowest low දක්වා range එක 50% ලකුණෙන් (equilibrium) දෙකට බෙදනවා. 50%ට **පහළ** කොටස **Discount**, 50%ට **ඉහළ** කොටස **Premium**. **Premium/Discount** column එකේ පෙන්නන්නේ OB zone එකේ මැද ඒ range එකේ කොයි තැනද කියන එකයි (0% = පහළම, 100% = ඉහළම).
+- **PD fit**: Bullish OB එකක් **Discount** එකේ, Bearish OB එකක් **Premium** එකේ තියෙනවා නම් ✅ Correct side. Bullish OB එකක් Premium එකේ හෝ Bearish OB එකක් Discount එකේ තියෙනවා නම් ⚠️ Wrong side. ICT සංකල්පයට අනුව ඒ වගේ OB එකක් අවලංගු වෙන්න වැඩි ඉඩක් තියෙනවා. "Only OBs on the correct side" ටික් කළොත් ⚠️ ඒවා ලැයිස්තුවෙන් අයින් වෙනවා.
+
+### 4. Confirmations සහ Score
+- **Confirmations**: OB එක අනිවාර්යයි (මිලට ළඟ, Max distance ඇතුළත OB එකක් නැති coins ලැයිස්තුවට එන්නේ නැහැ). ඒක ඇත්නම් අමතර තහවුරු කිරීම් විදිහට: **Turtle soup**, **CISD**, සහ **FVG near OB** පෙන්නනවා. Turtle soup සහ CISD බලන්නේ OB එකේ දිශාවටයි.
+- **Turtle soup**: Bullish නම්, මෑත candles 20ක අඩුම low එක මිල කඩලා (liquidity sweep), ඒත් candle එක ආපහු ඒ මට්ටමට උඩින් close වුණා නම්. Bearish නම් ඒකේ ප්‍රතිවිරුද්ධය. අන්තිම candles 3 ඇතුළත විතරයි බලන්නේ. (මේක OB එක හැදුණු sweep එකට වෙනස්: මේක දැන් මිල ළඟ වෙච්ච අලුත් sweep එකක් සඳහා අමතර ලකුණු දෙනවා.)
+- **CISD (Change in State of Delivery)**: සරල අර්ථ දැක්වීම: Bullish සඳහා, අඛණ්ඩ bearish candles පෙළක් ඇවිත් ඊට පස්සේ candle එකක් ඒ පෙළේ පළමු candle එකේ open එකට උඩින් close වුණා නම් (Bearish සඳහා ප්‍රතිවිරුද්ධය). අන්තිම candles 3 ඇතුළත විතරයි.
+- **FVG near OB**: OB එකේ දිශාවටම ගැළපෙන FVG එකක් OB කලාපය ඇතුළේ හෝ ඊට මිලෙන් 1% ඇතුළත තියෙනවා නම්.
+- **Score**: OB (zone එකට ළඟ) +2, මිල zone එක ඇතුළේ නම් +3. Turtle soup +2, CISD +2, FVG near OB +1. DXY filter එක on නම්: OB එකේ දිශාවට (Bullish OB = long, Bearish OB = short) DXY ගැළපෙනවා නම් (උදා: Bullish OB, DXY Bearish) +1, ගැළපෙන්නේ නැත්නම් -1. ලකුණු වැඩි = ඔයාගේ rules වලට වැඩියෙන් ගැළපෙනවා, ඒත් ජයග්‍රහණයක් සහතික කරන්නේ නැහැ.
 - **Minimum score**: මේ ලකුණට වඩා අඩු coins ලැයිස්තුවෙන් අයින් කරනවා. "High-impact news today" ටික් කළොත් අවශ්‍ය අවම ලකුණ 1කින් වැඩි වෙනවා.
 
-### 4. Settings (පාලන)
+### 5. Settings (පාලන)
 - **Exchange (data source)**: දත්ත ගන්න තැන. Binance Futures server එක block වෙන්න පුළුවන්. OKX Perpetual වැඩ කරනවා.
-- **Higher timeframe**: HTF එක 4H ද 1H ද කියලා තෝරනවා.
-- **Coins to scan (top by volume)**: volume වැඩිම coins කීයක් scan කරනවද කියන ගණන.
-- **Min 24h volume (million USD)**: පසුගිය පැය 24 තුළ ඒ coin එක ඩොලර් කීයක් වටිනාකමට trade වුණාද (මිලියන වලින්). වැඩි = trade කරන අය ගොඩක්, ලේසියෙන් මිලදී ගන්න/විකුණන්න පුළුවන් (හොඳ liquidity). අඩු = trade කරන අය ටික දෙනෙක්, මිල ඉක්මනින් අස්ථාවර වෙනවා, fake moves වැඩියි. මේ අගය OKX දත්ත වලින් එන නිසා Binance volume එකට වඩා වෙනස් වෙන්න පුළුවන්.
-- **Max distance to OB zone (%)**: මිල OB කලාපයෙන් මීට වඩා දුරින් තියෙනවා නම් ඒ OB එක සංඥාවක් විදිහට ගණන් ගන්නේ නැහැ.
+- **Coins to scan (top by volume)**: volume වැඩිම coins කීයක් scan කරනවද කියන ගණන. Timeframes වැඩිපුර තෝරන තරමට scan එක වැඩි වෙලාවක් ගත වෙනවා.
+- **Min 24h volume (million USD)**: පසුගිය පැය 24 තුළ ඒ coin එක ඩොලර් කීයක් වටිනාකමට trade වුණාද (මිලියන වලින්). වැඩි = trade කරන අය ගොඩක්, හොඳ liquidity. අඩු = මිල ඉක්මනින් අස්ථාවර වෙනවා, fake moves වැඩියි. මේ අගය තෝරපු exchange එකේ දත්ත වලින් එන නිසා Binance volume එකට වඩා වෙනස් වෙන්න පුළුවන්.
+- **Max distance to OB zone (%)**: මිල OB කලාපයෙන් මීට වඩා දුරින් තියෙනවා නම් ඒ OB එක ගණන් ගන්නේ නැහැ.
 - **Use DXY filter**: Dollar index (DXY) එකේ bias එක coins වල ලකුණු වලට එකතු කරනවා/අඩු කරනවා.
-- **Only coins also on Binance Futures**: OKX එකේත් Binance Futures එකේත් තියෙන coins විතරක් scan කරනවා.
+- **Only coins also on Binance Futures**: තෝරපු exchange එකේත් Binance Futures එකේත් තියෙන coins විතරක් scan කරනවා.
 - **High-impact news today**: අද CPI, Fed වගේ ලොකු news තියෙනවා නම් ටික් කරන්න. අවශ්‍ය අවම ලකුණ 1කින් වැඩි වෙනවා.
 - **Price**: coin එකේ දැන් මිල (තෝරපු exchange එකේ).
 
-### 5. Market overview (පිටුවේ උඩ කොටස)
-- **BTC daily bias**: BTC එකටත් එකම Rule 1 සහ Rule 2 යොදලා දවසේ දිශාව පෙන්නනවා. යටින් පෙන්නන්නේ අන්තිම වැසුණු දවසේ % වෙනස, දැන් මිල, අද දවසේ වෙනස, HTF එකේ Bias දිශාවට හමුවෙන සංඥා.
+### 6. Market overview (පිටුවේ උඩ කොටස)
+- **BTC daily bias**: BTC එකටත් එකම Rule 1 සහ Rule 2 යොදලා දවසේ දිශාව පෙන්නනවා. යටින් පෙන්නන්නේ අන්තිම වැසුණු දවසේ % වෙනස, දැන් මිල, අද දවසේ වෙනස, සහ ඔයා තෝරපු timeframe වල BTC එකට ළඟම තියෙන OB (තියෙනවා නම්).
 - **Dollar index (DXY)**: US ඩොලරයේ ශක්තිය මනින දර්ශකය. සාමාන්‍යයෙන් DXY ඉහළ යනකොට crypto පහළ යන්නත්, DXY පහළ යනකොට crypto ඉහළ යන්නත් ඉඩ වැඩියි. ඒත් ඒක හැමවිටම සත්‍ය නෙවෙයි.
-- **පණිවිඩය**: BTC සහ DXY එකිනෙකට ගැළපෙනවද (BTC ↑ + DXY ↓, හෝ BTC ↓ + DXY ↑) කියලා කෙටියෙන් කියනවා. ගැළපෙන්නේ නැත්නම් සංඥා මිශ්‍රයි කියලා ප්‍රවේශම් කරනවා.
+- **පණිවිඩය**: BTC සහ DXY එකිනෙකට ගැළපෙනවද කියලා කෙටියෙන් කියනවා.
 
 ### අවවාදය
 මේ rules ඔයාගේ strategy එකේ සරල කරපු අර්ථ දැක්වීම්. ඔයාගේ chart එකේ දකින දේට වෙනස් වෙන්න පුළුවන්. Scanner එක candidates ලැයිස්තුවක් විතරයි, trade advice නෙවෙයි. Chart එකේ තහවුරු කරලා, backtest කරලා පාවිච්චි කරන්න.
@@ -441,6 +530,6 @@ with st.expander("📖 Terms explained (අර්ථ විස්තර)"):
     )
 
 st.caption(
-    "Candidates only, not trade advice. Confirm on the chart, find your entry on the entry timeframe, "
-    "and backtest the rules before trading real money."
+    "Candidates only, not trade advice. Confirm on the chart and backtest the rules "
+    "before trading real money."
 )
