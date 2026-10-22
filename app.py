@@ -106,7 +106,9 @@ def cisd(d, bias, recent=3, scan=12):
     return False
 
 
-def dxy_bias():
+@st.cache_data(ttl=600, show_spinner=False)
+def dxy_info():
+    """Dollar index daily bias (Rule 1) and last closed-day % change."""
     try:
         d = yf.download("DX-Y.NYB", period="3mo", interval="1d", progress=False, auto_adjust=True)
         if isinstance(d.columns, pd.MultiIndex):
@@ -114,9 +116,44 @@ def dxy_bias():
         d = d.dropna(subset=["Close"])
         if d.index[-1].date() >= dt.datetime.now(dt.timezone.utc).date():
             d = d.iloc[:-1]
-        return "bull" if d["Close"].iloc[-1] > d["Close"].iloc[-2] else "bear"
+        last, prev = float(d["Close"].iloc[-1]), float(d["Close"].iloc[-2])
+        return {"bias": "bull" if last > prev else "bear", "pct": (last / prev - 1) * 100}
     except Exception:
         return None
+
+
+def dxy_bias():
+    info = dxy_info()
+    return info["bias"] if info else None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def btc_overview(exch, htf):
+    """BTC daily bias plus higher-timeframe signals in the bias direction."""
+    cfg = {"enableRateLimit": True}
+    if exch in ("okx", "bybit"):
+        cfg["options"] = {"defaultType": "swap", "defaultSubType": "linear"}
+    ex = getattr(ccxt, exch)(cfg)
+    sym = "BTC/USDT:USDT"
+    dd = candles(ex, sym, "1d", 60)
+    hd = candles(ex, sym, htf, 120)
+    bias, why = daily_bias(dd)
+    done = dd.iloc[:-1]
+    day_pct = (done.close.iloc[-1] / done.close.iloc[-2] - 1) * 100
+    price = float(hd.close.iloc[-1])
+    today_pct = (price / float(dd.open.iloc[-1]) - 1) * 100
+    closed = hd.iloc[:-1].reset_index(drop=True)
+    sigs = []
+    if turtle_soup(closed, bias):
+        sigs.append("Turtle soup")
+    if cisd(closed, bias):
+        sigs.append("CISD")
+    for kind, side, lo, hi in find_zones(closed.tail(100)):
+        if kind == "OB" and side == bias and lo * 0.97 <= price <= hi * 1.03:
+            sigs.append(f"OB {lo:.0f}-{hi:.0f}")
+            break
+    return {"bias": bias, "why": why, "day_pct": day_pct, "today_pct": today_pct,
+            "price": price, "sigs": sigs}
 
 
 def norm(base):
@@ -166,6 +203,38 @@ min_score = c5.slider("Minimum score", 1, 8, 3)
 use_dxy = c6.checkbox("Use DXY filter", True)
 only_bn = c6.checkbox("Only coins also on Binance Futures", True)
 news = c6.checkbox("High-impact news today (stricter)", False)
+
+htf = "4h" if mode.startswith("4H") else "1h"
+
+st.subheader("Market overview: BTC + Dollar index")
+o1, o2, o3 = st.columns(3)
+btc = None
+dxy_i = dxy_info()
+try:
+    btc = btc_overview(exch, htf)
+except Exception as e:
+    o1.warning(f"BTC overview not available from {exch_name}: {e}")
+if btc:
+    o1.metric("BTC daily bias", "🟢 Bullish" if btc["bias"] == "bull" else "🔴 Bearish",
+              f"{btc['day_pct']:+.2f}% last closed day")
+    o1.caption(
+        f"{btc['why']} | Price {btc['price']:,.1f} | today so far {btc['today_pct']:+.2f}%. "
+        f"{htf.upper()} signals in the bias direction: {', '.join(btc['sigs']) or 'none right now'}."
+    )
+if dxy_i:
+    o2.metric("Dollar index (DXY) daily bias",
+              "🟢 Bullish ↑" if dxy_i["bias"] == "bull" else "🔴 Bearish ↓",
+              f"{dxy_i['pct']:+.2f}% last closed day", delta_color="inverse")
+    o2.caption("DXY ඉහළ ගියාම crypto වලට පීඩනයක්, පහළ ගියාම සහායක් වෙන්න සාමාන්‍යයෙන් ඉඩ තියෙනවා (හැමවිටම නෙවෙයි).")
+else:
+    o2.warning("DXY data is not available right now.")
+if btc and dxy_i:
+    if btc["bias"] == "bull" and dxy_i["bias"] == "bear":
+        o3.success("BTC ↑ සහ DXY ↓: දෙකම crypto වලට හිතකරයි. Long setups වලට වාසිදායක තත්ත්වයක්.")
+    elif btc["bias"] == "bear" and dxy_i["bias"] == "bull":
+        o3.warning("BTC ↓ සහ DXY ↑: දෙකම crypto වලට අහිතකරයි. Short setups වලට වාසිදායක තත්ත්වයක්, long වලදී ප්‍රවේශම් වන්න.")
+    else:
+        o3.info("BTC සහ DXY සංඥා මිශ්‍රයි (එකිනෙකට ගැළපෙන්නේ නැහැ). ප්‍රවේශම් වන්න, ලකුණු අඩු coins මගහරින්න.")
 
 if st.button("Scan", type="primary"):
     htf = "4h" if mode.startswith("4H") else "1h"
@@ -295,6 +364,50 @@ if res:
             st.info("No coins reached the minimum score. Lower it or rescan later.")
         else:
             st.dataframe(df[cols], hide_index=True)
+
+with st.expander("📖 Terms explained (අර්ථ විස්තර)"):
+    st.markdown(
+        """
+### 1. Daily Bias (දවසේ දිශාව)
+- **Bias**: Daily chart එකෙන් තීරණය කරන දිශාව. **Bullish 🟢** = ඉහළ යන්න වැඩි ඉඩක් (long setups හොයන්න), **Bearish 🔴** = පහළ යන්න වැඩි ඉඩක් (short setups හොයන්න). මේක අනාවැකියක් නෙවෙයි, ඔයාගේ rules වලට අනුව හදන දිශා නිගමනයක් විතරයි.
+- **Rule 1 (close එකට close)**: අන්තිමට වැසුණු daily candle එක, ඊට කලින් දවසේ close එකට වඩා ඉහළින් close වුණා නම් Bullish, පහළින් close වුණා නම් Bearish.
+- **Rule 2 (key level rejection)**: අන්තිම daily candle එකේ දිග wick එකක් (wick එක body එකට වඩා දෙගුණයක් හෝ වැඩි, candle එකෙන් අඩකට වඩා) key level එකක (FVG හෝ OB) ළඟ හැදුණා නම්, එතැනින් market එක හැරුණා කියලා සලකලා Bias එක ඒ දිශාවට වෙනස් කරනවා (Rule 1 අභිබවා). පහළ wick + bullish zone = Bullish, ඉහළ wick + bearish zone = Bearish.
+- **Bias basis** (table එකේ column එක): Bias එක ආවේ Rule 1 එකෙන්ද Rule 2 එකෙන්ද කියලා පෙන්නනවා.
+- **Key level**: මිල කලින් ප්‍රතිචාර දක්වපු වැදගත් මිල කලාපයක්. මෙහිදී FVG සහ OB.
+- **FVG (Fair Value Gap)**: candle 3ක් අතරේ, මැද candle එක වේගයෙන් ගිය නිසා පළමු candle එකේ high එකයි තුන්වැනි candle එකේ low එකයි අතර හිස් ඉඩක් ඉතිරි වීම. මිල ආපහු ඒක පුරවන්න එන්න ඉඩ තියෙනවා කියලා සලකනවා. Candle එකක් ඒ කලාපය හරහා close වුණාම ඒක අවලංගුයි.
+
+### 2. Higher timeframe (HTF) සංඥා
+- **HTF**: සංඥා හොයන chart එක, 4H හෝ 1H. **Entry TF**: ඔයා chart එකේ බලලා entry ගන්න timeframe එක (4H නම් 15m, 1H නම් 5m). Scanner එක Entry TF එක විශ්ලේෂණය කරන්නේ නැහැ.
+- **OB (Order Block)**: ශක්තිමත් වේගවත් ගමනකට (සාමාන්‍ය candle ප්‍රමාණයේ 1.5 ගුණයකට වඩා විශාල candle එකකට) කලින් තිබුණු අන්තිම ප්‍රතිවිරුද්ධ candle එක. Bullish OB = ඉහළ යන වේගවත් ගමනකට කලින් තිබුණු අන්තිම bearish candle එක. Candle එකක් ඒ කලාපය හරහා close වුණාම අවලංගුයි. Bias දිශාවට ගැළපෙන OB එකකට මිල දැන් ළඟද කියලා scanner එක බලනවා.
+- **OB zone**: OB candle එකේ low සිට high දක්වා මිල කලාපය. **Dist %**: දැන් මිල ඒ කලාපයට ඇති දුර (%). `0` = මිල කලාපය ඇතුළේ. `None` හෝ `-` = ළඟ OB එකක් නැහැ.
+- **Turtle soup**: Bullish නම්, මෑත candles 20ක අඩුම low එක මිල කඩලා (liquidity sweep), ඒත් candle එක ආපහු ඒ මට්ටමට උඩින් close වුණා නම්. Bearish නම් ඒකේ ප්‍රතිවිරුද්ධය (high එක). අන්තිම candles 3 ඇතුළත විතරයි බලන්නේ.
+- **CISD (Change in State of Delivery)**: මෙහි සරල අර්ථ දැක්වීම: Bullish සඳහා, අඛණ්ඩ bearish candles පෙළක් ඇවිත් ඊට පස්සේ candle එකක් ඒ පෙළේ පළමු candle එකේ open එකට උඩින් close වුණා නම්. (Bearish සඳහා ප්‍රතිවිරුද්ධය.) අන්තිම candles 3 ඇතුළත විතරයි බලන්නේ.
+- **Signals**: Turtle soup, CISD, OB යන තුනෙන් ඒ coin එකට හමුවුණ ඒවා. සංඥාවක් නැති coins ලැයිස්තුවට එන්නේ නැහැ.
+
+### 3. Score (ලකුණු)
+- **Score**: Turtle soup +2, CISD +2, OB (zone එකට ළඟ) +2, මිල zone එක ඇතුළේ නම් +3. DXY filter එක on නම්: coin එකේ Bias එකට ප්‍රතිවිරුද්ධ DXY bias එකක් (උදා: coin Bullish, DXY Bearish) නම් +1, සමාන නම් -1. ලකුණු වැඩි = ඔයාගේ rules වලට වැඩියෙන් ගැළපෙනවා. ඒත් ජයග්‍රහණයක් සහතික කරන්නේ නැහැ.
+- **Minimum score**: මේ ලකුණට වඩා අඩු coins ලැයිස්තුවෙන් අයින් කරනවා. "High-impact news today" ටික් කළොත් අවශ්‍ය අවම ලකුණ 1කින් වැඩි වෙනවා.
+
+### 4. Settings (පාලන)
+- **Exchange (data source)**: දත්ත ගන්න තැන. Binance Futures server එක block වෙන්න පුළුවන්. OKX Perpetual වැඩ කරනවා.
+- **Higher timeframe**: HTF එක 4H ද 1H ද කියලා තෝරනවා.
+- **Coins to scan (top by volume)**: volume වැඩිම coins කීයක් scan කරනවද කියන ගණන.
+- **Min 24h volume (million USD)**: පසුගිය පැය 24 තුළ ඒ coin එක ඩොලර් කීයක් වටිනාකමට trade වුණාද (මිලියන වලින්). වැඩි = trade කරන අය ගොඩක්, ලේසියෙන් මිලදී ගන්න/විකුණන්න පුළුවන් (හොඳ liquidity). අඩු = trade කරන අය ටික දෙනෙක්, මිල ඉක්මනින් අස්ථාවර වෙනවා, fake moves වැඩියි. මේ අගය OKX දත්ත වලින් එන නිසා Binance volume එකට වඩා වෙනස් වෙන්න පුළුවන්.
+- **Max distance to OB zone (%)**: මිල OB කලාපයෙන් මීට වඩා දුරින් තියෙනවා නම් ඒ OB එක සංඥාවක් විදිහට ගණන් ගන්නේ නැහැ.
+- **Use DXY filter**: Dollar index (DXY) එකේ bias එක coins වල ලකුණු වලට එකතු කරනවා/අඩු කරනවා.
+- **Only coins also on Binance Futures**: OKX එකේත් Binance Futures එකේත් තියෙන coins විතරක් scan කරනවා.
+- **High-impact news today**: අද CPI, Fed වගේ ලොකු news තියෙනවා නම් ටික් කරන්න. අවශ්‍ය අවම ලකුණ 1කින් වැඩි වෙනවා.
+- **Price**: coin එකේ දැන් මිල (තෝරපු exchange එකේ).
+
+### 5. Market overview (පිටුවේ උඩ කොටස)
+- **BTC daily bias**: BTC එකටත් එකම Rule 1 සහ Rule 2 යොදලා දවසේ දිශාව පෙන්නනවා. යටින් පෙන්නන්නේ අන්තිම වැසුණු දවසේ % වෙනස, දැන් මිල, අද දවසේ වෙනස, HTF එකේ Bias දිශාවට හමුවෙන සංඥා.
+- **Dollar index (DXY)**: US ඩොලරයේ ශක්තිය මනින දර්ශකය. සාමාන්‍යයෙන් DXY ඉහළ යනකොට crypto පහළ යන්නත්, DXY පහළ යනකොට crypto ඉහළ යන්නත් ඉඩ වැඩියි. ඒත් ඒක හැමවිටම සත්‍ය නෙවෙයි.
+- **පණිවිඩය**: BTC සහ DXY එකිනෙකට ගැළපෙනවද (BTC ↑ + DXY ↓, හෝ BTC ↓ + DXY ↑) කියලා කෙටියෙන් කියනවා. ගැළපෙන්නේ නැත්නම් සංඥා මිශ්‍රයි කියලා ප්‍රවේශම් කරනවා.
+
+### අවවාදය
+මේ rules ඔයාගේ strategy එකේ සරල කරපු අර්ථ දැක්වීම්. ඔයාගේ chart එකේ දකින දේට වෙනස් වෙන්න පුළුවන්. Scanner එක candidates ලැයිස්තුවක් විතරයි, trade advice නෙවෙයි. Chart එකේ තහවුරු කරලා, backtest කරලා පාවිච්චි කරන්න.
+"""
+    )
 
 st.caption(
     "Candidates only, not trade advice. Confirm on the chart, find your entry on the entry timeframe, "
