@@ -320,7 +320,7 @@ if st.button("Scan", type="primary"):
             if best:
                 sigs.append("OB")
                 score += 3 if best[0] == 0 else 2
-            if sigs:
+            if best:  # OB is mandatory; CISD and turtle soup only add score
                 adj = 0 if dxy is None else (1 if dxy != bias else -1)
                 rows.append({
                     "Coin": ex.markets[s]["base"],
@@ -355,7 +355,7 @@ if res:
     need = min_score + (1 if news else 0)
     df = pd.DataFrame(res["rows"])
     if df.empty:
-        st.info("No coins showed a signal in this scan.")
+        st.info("No coins had an OB near the price in this scan. Try a larger OB distance or a lower minimum volume.")
     else:
         df["Score"] = df["base"] + (df["dxy_adj"] if use_dxy else 0)
         df = df[df["Score"] >= need].sort_values(["Score", "Dist %"], ascending=[False, True])
@@ -382,7 +382,7 @@ with st.expander("📖 Terms explained (අර්ථ විස්තර)"):
 - **OB zone**: OB candle එකේ low සිට high දක්වා මිල කලාපය. **Dist %**: දැන් මිල ඒ කලාපයට ඇති දුර (%). `0` = මිල කලාපය ඇතුළේ. `None` හෝ `-` = ළඟ OB එකක් නැහැ.
 - **Turtle soup**: Bullish නම්, මෑත candles 20ක අඩුම low එක මිල කඩලා (liquidity sweep), ඒත් candle එක ආපහු ඒ මට්ටමට උඩින් close වුණා නම්. Bearish නම් ඒකේ ප්‍රතිවිරුද්ධය (high එක). අන්තිම candles 3 ඇතුළත විතරයි බලන්නේ.
 - **CISD (Change in State of Delivery)**: මෙහි සරල අර්ථ දැක්වීම: Bullish සඳහා, අඛණ්ඩ bearish candles පෙළක් ඇවිත් ඊට පස්සේ candle එකක් ඒ පෙළේ පළමු candle එකේ open එකට උඩින් close වුණා නම්. (Bearish සඳහා ප්‍රතිවිරුද්ධය.) අන්තිම candles 3 ඇතුළත විතරයි බලන්නේ.
-- **Signals**: Turtle soup, CISD, OB යන තුනෙන් ඒ coin එකට හමුවුණ ඒවා. සංඥාවක් නැති coins ලැයිස්තුවට එන්නේ නැහැ.
+- **Signals**: Turtle soup, CISD, OB යන තුනෙන් ඒ coin එකට හමුවුණ ඒවා. **OB එකක් අනිවාර්යයි**: Bias දිශාවට ගැළපෙන, මිලට ළඟ (Max distance ඇතුළත) OB එකක් නැති coins ලැයිස්තුවට එන්නේ නැහැ. Turtle soup සහ CISD අමතර විදිහට ලකුණු එකතු කරනවා විතරයි.
 
 ### 3. Score (ලකුණු)
 - **Score**: Turtle soup +2, CISD +2, OB (zone එකට ළඟ) +2, මිල zone එක ඇතුළේ නම් +3. DXY filter එක on නම්: coin එකේ Bias එකට ප්‍රතිවිරුද්ධ DXY bias එකක් (උදා: coin Bullish, DXY Bearish) නම් +1, සමාන නම් -1. ලකුණු වැඩි = ඔයාගේ rules වලට වැඩියෙන් ගැළපෙනවා. ඒත් ජයග්‍රහණයක් සහතික කරන්නේ නැහැ.
