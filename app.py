@@ -299,36 +299,50 @@ if st.button("Scan", type="primary"):
             closed = hd.iloc[:-1].reset_index(drop=True)
             price = float(hd.close.iloc[-1])
             sigs, score = [], 0
-            if turtle_soup(closed, bias):
-                sigs.append("Turtle soup")
-                score += 2
-            if cisd(closed, bias):
-                sigs.append("CISD")
-                score += 2
+            # nearest unmitigated OB (bullish OR bearish) around the current price
+            zones = find_zones(closed.tail(100))
             best = None
-            for kind, side, lo, hi in find_zones(closed.tail(100)):
-                if kind != "OB" or side != bias:
+            for kind, side, lo, hi in zones:
+                if kind != "OB":
                     continue
+                if (side == "bull" and price < lo) or (side == "bear" and price > hi):
+                    continue  # price is already beyond the zone
                 if lo <= price <= hi:
                     dist = 0.0
                 elif price > hi:
                     dist = (price - hi) / price * 100
                 else:
                     dist = (lo - price) / price * 100
-                if dist <= prox and (best is None or dist < best[0]):
-                    best = (dist, lo, hi)
-            if best:
-                sigs.append("OB")
-                score += 3 if best[0] == 0 else 2
-            if best:  # OB is mandatory; CISD and turtle soup only add score
-                adj = 0 if dxy is None else (1 if dxy != bias else -1)
+                key = (dist, 0 if side == bias else 1)
+                if dist <= prox and (best is None or key < best[0]):
+                    best = (key, side, lo, hi)
+            if best:  # OB is mandatory; the rest are extra confirmations that add score
+                (dist, _), ob_side, lo, hi = best
+                score += 3 if dist == 0 else 2
+                if turtle_soup(closed, ob_side):
+                    sigs.append("Turtle soup")
+                    score += 2
+                if cisd(closed, ob_side):
+                    sigs.append("CISD")
+                    score += 2
+                for kind, side, flo, fhi in zones:  # same-side FVG overlapping/near the OB
+                    if kind != "FVG" or side != ob_side:
+                        continue
+                    gap = 0.0 if (fhi >= lo and flo <= hi) else (flo - hi if flo > hi else lo - fhi)
+                    if gap / price * 100 <= 1.0:
+                        sigs.append("FVG near OB")
+                        score += 1
+                        break
+                adj = 0 if dxy is None else (1 if dxy != ob_side else -1)
                 rows.append({
                     "Coin": ex.markets[s]["base"],
-                    "Bias": "🟢 Bullish" if bias == "bull" else "🔴 Bearish",
+                    "Daily bias": "🟢 Bullish" if bias == "bull" else "🔴 Bearish",
                     "Bias basis": why,
-                    "Signals": ", ".join(sigs),
-                    "OB zone": f"{best[1]:.6g} – {best[2]:.6g}" if best else "-",
-                    "Dist %": round(best[0], 2) if best else None,
+                    "OB type": "🟢 Bullish OB" if ob_side == "bull" else "🔴 Bearish OB",
+                    "Setup": "With bias" if ob_side == bias else "Pullback (against bias)",
+                    "Confirmations": ", ".join(sigs) or "-",
+                    "OB zone": f"{lo:.6g} – {hi:.6g}",
+                    "Dist %": round(dist, 2),
                     "Price": price,
                     "Entry TF": entry,
                     "base": score,
@@ -359,7 +373,8 @@ if res:
     else:
         df["Score"] = df["base"] + (df["dxy_adj"] if use_dxy else 0)
         df = df[df["Score"] >= need].sort_values(["Score", "Dist %"], ascending=[False, True])
-        cols = ["Coin", "Score", "Bias", "Bias basis", "Signals", "OB zone", "Dist %", "Price", "Entry TF"]
+        cols = ["Coin", "Score", "Daily bias", "Bias basis", "OB type", "Setup", "Confirmations",
+                "OB zone", "Dist %", "Price", "Entry TF"]
         if df.empty:
             st.info("No coins reached the minimum score. Lower it or rescan later.")
         else:
@@ -378,14 +393,14 @@ with st.expander("📖 Terms explained (අර්ථ විස්තර)"):
 
 ### 2. Higher timeframe (HTF) සංඥා
 - **HTF**: සංඥා හොයන chart එක, 4H හෝ 1H. **Entry TF**: ඔයා chart එකේ බලලා entry ගන්න timeframe එක (4H නම් 15m, 1H නම් 5m). Scanner එක Entry TF එක විශ්ලේෂණය කරන්නේ නැහැ.
-- **OB (Order Block)**: ශක්තිමත් වේගවත් ගමනකට (සාමාන්‍ය candle ප්‍රමාණයේ 1.5 ගුණයකට වඩා විශාල candle එකකට) කලින් තිබුණු අන්තිම ප්‍රතිවිරුද්ධ candle එක. Bullish OB = ඉහළ යන වේගවත් ගමනකට කලින් තිබුණු අන්තිම bearish candle එක. Candle එකක් ඒ කලාපය හරහා close වුණාම අවලංගුයි. Bias දිශාවට ගැළපෙන OB එකකට මිල දැන් ළඟද කියලා scanner එක බලනවා.
+- **OB (Order Block)**: ශක්තිමත් වේගවත් ගමනකට (සාමාන්‍ය candle ප්‍රමාණයේ 1.5 ගුණයකට වඩා විශාල candle එකකට) කලින් තිබුණු අන්තිම ප්‍රතිවිරුද්ධ candle එක. Bullish OB = ඉහළ යන වේගවත් ගමනකට කලින් තිබුණු අන්තිම bearish candle එක. Candle එකක් ඒ කලාපය හරහා close වුණාම අවලංගුයි. Bearish OB = පහළ යන වේගවත් ගමනකට කලින් තිබුණු අන්තිම bullish (ඉහළ) candle එක. Scanner එක බලන්නේ Bullish OB හෝ Bearish OB එකක් (Daily bias එකට ගැළපුණත් නැතත්) මිලට ළඟද කියලායි. දෙකම වෙන වෙනම පෙන්නනවා: **Daily bias** column එකේ දවසේ දිශාව, **OB type** column එකේ OB එකේ වර්ගය. Daily bias එක Bearish වෙලා Bullish OB එකක් ළඟ ඉන්නවා නම් ඒක **Pullback (against bias)** setup එකක්. OB එක bias එකටම ගැළපෙනවා නම් **With bias**.
 - **OB zone**: OB candle එකේ low සිට high දක්වා මිල කලාපය. **Dist %**: දැන් මිල ඒ කලාපයට ඇති දුර (%). `0` = මිල කලාපය ඇතුළේ. `None` හෝ `-` = ළඟ OB එකක් නැහැ.
 - **Turtle soup**: Bullish නම්, මෑත candles 20ක අඩුම low එක මිල කඩලා (liquidity sweep), ඒත් candle එක ආපහු ඒ මට්ටමට උඩින් close වුණා නම්. Bearish නම් ඒකේ ප්‍රතිවිරුද්ධය (high එක). අන්තිම candles 3 ඇතුළත විතරයි බලන්නේ.
 - **CISD (Change in State of Delivery)**: මෙහි සරල අර්ථ දැක්වීම: Bullish සඳහා, අඛණ්ඩ bearish candles පෙළක් ඇවිත් ඊට පස්සේ candle එකක් ඒ පෙළේ පළමු candle එකේ open එකට උඩින් close වුණා නම්. (Bearish සඳහා ප්‍රතිවිරුද්ධය.) අන්තිම candles 3 ඇතුළත විතරයි බලන්නේ.
-- **Signals**: Turtle soup, CISD, OB යන තුනෙන් ඒ coin එකට හමුවුණ ඒවා. **OB එකක් අනිවාර්යයි**: Bias දිශාවට ගැළපෙන, මිලට ළඟ (Max distance ඇතුළත) OB එකක් නැති coins ලැයිස්තුවට එන්නේ නැහැ. Turtle soup සහ CISD අමතර විදිහට ලකුණු එකතු කරනවා විතරයි.
+- **Confirmations**: OB එක අනිවාර්යයි (මිලට ළඟ, Max distance ඇතුළත OB එකක් නැති coins ලැයිස්තුවට එන්නේ නැහැ). ඒක ඇත්නම් අමතර තහවුරු කිරීම් විදිහට පෙන්නන්නේ: Turtle soup, CISD, සහ **FVG near OB** (OB එකේ දිශාවටම ගැළපෙන FVG එකක් OB කලාපය ඇතුළේ හෝ ඊට මිලෙන් 1% ඇතුළත තියෙනවා නම්). Turtle soup සහ CISD බලන්නේ **OB එකේ දිශාවටයි** (Bullish OB එකකට bullish ඒවා, Bearish OB එකකට bearish ඒවා).
 
 ### 3. Score (ලකුණු)
-- **Score**: Turtle soup +2, CISD +2, OB (zone එකට ළඟ) +2, මිල zone එක ඇතුළේ නම් +3. DXY filter එක on නම්: coin එකේ Bias එකට ප්‍රතිවිරුද්ධ DXY bias එකක් (උදා: coin Bullish, DXY Bearish) නම් +1, සමාන නම් -1. ලකුණු වැඩි = ඔයාගේ rules වලට වැඩියෙන් ගැළපෙනවා. ඒත් ජයග්‍රහණයක් සහතික කරන්නේ නැහැ.
+- **Score**: OB (zone එකට ළඟ) +2, මිල zone එක ඇතුළේ නම් +3. Turtle soup +2, CISD +2, FVG near OB +1. DXY filter එක on නම්: OB එකේ දිශාවට (Bullish OB = long, Bearish OB = short) DXY ගැළපෙනවා නම් (උදා: Bullish OB, DXY Bearish) +1, ගැළපෙන්නේ නැත්නම් -1. ලකුණු වැඩි = ඔයාගේ rules වලට වැඩියෙන් ගැළපෙනවා. ඒත් ජයග්‍රහණයක් සහතික කරන්නේ නැහැ. With bias සහ Pullback setups වලට වෙනම ලකුණු නැහැ, ඒවා Setup column එකෙන් වෙන්කරලා බලන්න.
 - **Minimum score**: මේ ලකුණට වඩා අඩු coins ලැයිස්තුවෙන් අයින් කරනවා. "High-impact news today" ටික් කළොත් අවශ්‍ය අවම ලකුණ 1කින් වැඩි වෙනවා.
 
 ### 4. Settings (පාලන)
