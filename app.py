@@ -1,6 +1,8 @@
 import datetime as dt
+import re
 
 import ccxt
+import requests
 import pandas as pd
 import streamlit as st
 import yfinance as yf
@@ -117,6 +119,29 @@ def dxy_bias():
         return None
 
 
+def norm(base):
+    """1000PEPE -> PEPE, 1MBABYDOGE -> BABYDOGE, so names match across exchanges."""
+    return re.sub(r"^(1000000|1000|1M)", "", base.upper())
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def binance_futures_bases():
+    """Coins with a Binance USDT perpetual. Binance's own API is blocked from this server,
+    so the list comes from CoinGecko (cached for 6 hours)."""
+    r = requests.get(
+        "https://api.coingecko.com/api/v3/derivatives/exchanges/binance_futures",
+        params={"include_tickers": "unexpired"},
+        headers={"accept": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    out = set()
+    for t in r.json().get("tickers", []):
+        if t.get("target") == "USDT" and t.get("contract_type", "perpetual") == "perpetual":
+            out.add(norm(t["base"]))
+    return sorted(out)
+
+
 def label(b):
     return {"bull": "Bullish", "bear": "Bearish"}.get(b, "unavailable")
 
@@ -136,8 +161,10 @@ top_n = c3.slider("Coins to scan (top by volume)", 20, 150, 50, 10)
 
 c4, c5, c6 = st.columns(3)
 prox = c4.slider("Max distance to OB zone (%)", 0.5, 10.0, 3.0, 0.5)
-min_score = c5.slider("Minimum score", 1, 8, 2)
+min_vol = c4.slider("Min 24h volume (million USD)", 1, 500, 20)
+min_score = c5.slider("Minimum score", 1, 8, 3)
 use_dxy = c6.checkbox("Use DXY filter", True)
+only_bn = c6.checkbox("Only coins also on Binance Futures", True)
 news = c6.checkbox("High-impact news today (stricter)", False)
 
 if st.button("Scan", type="primary"):
@@ -154,12 +181,31 @@ if st.button("Scan", type="primary"):
         st.error(f"Could not get data from {exch_name}: {e}. Try another exchange.")
         st.stop()
 
+    bn = None
+    if only_bn and exch != "binanceusdm":
+        try:
+            bn = set(binance_futures_bases())
+        except Exception as e:
+            st.error(
+                f"Could not get the Binance Futures coin list: {e}. "
+                "Wait a minute and scan again, or untick the Binance filter."
+            )
+            st.stop()
+
     pairs = []
     for s, m in ex.markets.items():
         if (m.get("swap") and m.get("linear") and m.get("quote") == "USDT"
                 and m.get("settle") == "USDT" and m.get("active") is not False
                 and m.get("base") not in STABLES and s in tick):
-            pairs.append((float(tick[s].get("quoteVolume") or 0), s))
+            if bn is not None and norm(m["base"]) not in bn:
+                continue
+            t = tick[s]
+            vol = t.get("quoteVolume")
+            if not vol and t.get("baseVolume") and t.get("last"):
+                vol = t["baseVolume"] * t["last"]
+            pairs.append((float(vol or 0), s))
+    if any(v > 0 for v, _ in pairs):  # volume data available: keep liquid coins only
+        pairs = [p for p in pairs if p[0] >= min_vol * 1_000_000]
     syms = [s for _, s in sorted(pairs, reverse=True)[:top_n]]
     if not syms:
         st.error("No USDT pairs found on this exchange. Try another one.")
@@ -224,6 +270,7 @@ if st.button("Scan", type="primary"):
     bar.empty()
     st.session_state["res"] = {
         "rows": rows, "fails": fails, "n": len(syms), "exch": exch_name, "htf": htf.upper(),
+        "bn": bn is not None,
         "dxy": dxy, "time": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"),
     }
 
@@ -231,7 +278,8 @@ res = st.session_state.get("res")
 if res:
     st.caption(
         f"Scanned {res['n']} coins on {res['exch']} at {res['time']} UTC | HTF {res['htf']} | "
-        f"DXY daily bias: {label(res['dxy'])} | failed: {res['fails']}"
+        f"DXY daily bias: {label(res['dxy'])} | Binance Futures filter: {'on' if res['bn'] else 'off'} | "
+        f"failed: {res['fails']}"
     )
     if news:
         st.warning("News risk is on: the minimum score is raised by 1. Check the calendar before entering.")
