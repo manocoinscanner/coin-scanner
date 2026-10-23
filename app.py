@@ -256,6 +256,16 @@ def norm(base):
 def binance_futures_bases():
     """Coins with a Binance USDT perpetual. Binance's own API is blocked from this server,
     so the list comes from CoinGecko (cached for 6 hours)."""
+    try:  # first choice: the full market list straight from Binance
+        bx = ccxt.binanceusdm({"enableRateLimit": True})
+        bx.load_markets()
+        got = {norm(m["base"]) for m in bx.markets.values()
+               if m.get("swap") and m.get("linear") and m.get("quote") == "USDT"
+               and m.get("settle") == "USDT" and m.get("active") is not False}
+        if len(got) > 100:
+            return sorted(got)
+    except Exception:
+        pass
     r = requests.get(
         "https://api.coingecko.com/api/v3/derivatives/exchanges/binance_futures",
         params={"include_tickers": "unexpired"},
@@ -412,10 +422,12 @@ if st.button("Scan", type="primary"):
             st.stop()
 
     pairs = []
+    n_ex = 0  # USDT perpetuals on the chosen exchange
     for s, m in ex.markets.items():
         if (m.get("swap") and m.get("linear") and m.get("quote") == "USDT"
                 and m.get("settle") == "USDT" and m.get("active") is not False
                 and m.get("base") not in STABLES and s in tick):
+            n_ex += 1
             if bn is not None and norm(m["base"]) not in bn:
                 continue
             t = tick[s]
@@ -423,6 +435,7 @@ if st.button("Scan", type="primary"):
             if not vol and t.get("baseVolume") and t.get("last"):
                 vol = t["baseVolume"] * t["last"]
             pairs.append((float(vol or 0), s))
+    n_match = len(pairs)  # coins left after the Binance filter
     if any(v > 0 for v, _ in pairs):  # volume data available: keep liquid coins only
         pairs = [p for p in pairs if p[0] >= min_vol * 1_000_000]
     ranked = [s for _, s in sorted(pairs, reverse=True)]
@@ -482,6 +495,7 @@ if st.button("Scan", type="primary"):
     st.session_state["res"] = {
         "rows": rows, "fails": fails, "n": len(syms), "exch": exch_name, "tfs": list(tf_choice),
         "bn": bn is not None, "dxy": dxy,
+        "n_ex": n_ex, "n_bn": len(bn) if bn is not None else None, "n_match": n_match,
         "time": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"),
     }
 
@@ -491,6 +505,11 @@ if res:
         f"Scanned {res['n']} coins on {res['exch']} at {res['time']} UTC | OB timeframes: {', '.join(res['tfs'])} | "
         f"DXY daily bias: {label(res['dxy'])} | Binance Futures filter: {'on' if res['bn'] else 'off'} | "
         f"failed: {res['fails']}"
+    )
+    st.caption(
+        f"Coin counts: {res['exch']} USDT perpetuals = {res['n_ex']}"
+        + (f" | Binance Futures list = {res['n_bn']}" if res["n_bn"] is not None else "")
+        + f" | common / after Binance filter = {res['n_match']} | actually scanned = {res['n']}"
     )
     if news:
         st.warning("News risk is on: the minimum score is raised by 1. Check the calendar before entering.")
