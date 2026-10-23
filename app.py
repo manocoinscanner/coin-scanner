@@ -329,10 +329,11 @@ exch_name = c1.selectbox("Exchange (data source)", list(EXCHANGES))
 exch = EXCHANGES[exch_name]
 tf_choice = c2.multiselect("OB timeframe(s)", list(TF_MAP), default=["4H"])
 top_n = c3.slider("Coins to scan (top by volume)", 20, 150, 50, 10)
+scan_all = c3.checkbox("Scan ALL matching coins (ignore the limit above)", True)
 
 c4, c5, c6 = st.columns(3)
 prox = c4.slider("Max distance to OB zone (%)", 0.5, 10.0, 3.0, 0.5)
-min_vol = c4.slider("Min 24h volume (million USD)", 1, 500, 20)
+min_vol = c4.slider("Min 24h volume (million USD, 0 = no limit)", 0, 500, 0)
 min_score = c5.slider("Minimum score", 1, 9, 3)
 swing_k = c5.slider("Swing sensitivity (candles on each side)", 1, 5, 2)
 use_dxy = c6.checkbox("Use DXY filter", True)
@@ -424,7 +425,8 @@ if st.button("Scan", type="primary"):
             pairs.append((float(vol or 0), s))
     if any(v > 0 for v, _ in pairs):  # volume data available: keep liquid coins only
         pairs = [p for p in pairs if p[0] >= min_vol * 1_000_000]
-    syms = [s for _, s in sorted(pairs, reverse=True)[:top_n]]
+    ranked = [s for _, s in sorted(pairs, reverse=True)]
+    syms = ranked if scan_all else ranked[:top_n]
     if not syms:
         st.error("No coins matched the filters. Lower the minimum volume or untick the Binance filter.")
         st.stop()
