@@ -338,8 +338,8 @@ c1, c2, c3 = st.columns(3)
 exch_name = c1.selectbox("Exchange (data source)", list(EXCHANGES))
 exch = EXCHANGES[exch_name]
 tf_choice = c2.multiselect("OB timeframe(s)", list(TF_MAP), default=["4H"])
-top_n = c3.slider("Coins to scan (top by volume)", 20, 150, 50, 10)
-scan_all = c3.checkbox("Scan ALL matching coins (ignore the limit above)", True)
+scan_all = c3.checkbox("Scan ALL matching coins (no limit)", True)
+top_n = c3.slider("Coins to scan (top by volume)", 20, 600, 50, 10, disabled=scan_all)
 
 c4, c5, c6 = st.columns(3)
 prox = c4.slider("Max distance to OB zone (%)", 0.5, 10.0, 3.0, 0.5)
