@@ -438,6 +438,7 @@ if st.button("Scan", type="primary"):
     n_match = len(pairs)  # coins left after the Binance filter
     if any(v > 0 for v, _ in pairs):  # volume data available: keep liquid coins only
         pairs = [p for p in pairs if p[0] >= min_vol * 1_000_000]
+    n_vol = len(pairs)  # coins left after the volume filter
     ranked = [s for _, s in sorted(pairs, reverse=True)]
     syms = ranked if scan_all else ranked[:top_n]
     if not syms:
@@ -495,7 +496,8 @@ if st.button("Scan", type="primary"):
     st.session_state["res"] = {
         "rows": rows, "fails": fails, "n": len(syms), "exch": exch_name, "tfs": list(tf_choice),
         "bn": bn is not None, "dxy": dxy,
-        "n_ex": n_ex, "n_bn": len(bn) if bn is not None else None, "n_match": n_match,
+        "n_ex": n_ex, "n_bn": len(bn) if bn is not None else None, "n_match": n_match, "n_vol": n_vol,
+        "min_vol": min_vol, "scan_all": scan_all, "top_n": top_n,
         "time": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"),
     }
 
@@ -509,8 +511,19 @@ if res:
     st.caption(
         f"Coin counts: {res['exch']} USDT perpetuals = {res['n_ex']}"
         + (f" | Binance Futures list = {res['n_bn']}" if res["n_bn"] is not None else "")
-        + f" | common / after Binance filter = {res['n_match']} | actually scanned = {res['n']}"
+        + f" | common / after Binance filter = {res['n_match']}"
+        + f" | after volume filter (min {res['min_vol']}M) = {res['n_vol']} | actually scanned = {res['n']}"
     )
+    if res["n_vol"] < res["n_match"]:
+        st.warning(
+            f"Min 24h volume ({res['min_vol']}M USD) removed {res['n_match'] - res['n_vol']} coins. "
+            "Set 'Min 24h volume' to 0 to include them."
+        )
+    if not res["scan_all"] and res["n"] < res["n_vol"]:
+        st.warning(
+            f"'Scan ALL' is off, so only the top {res['top_n']} coins by volume were scanned. "
+            "Tick 'Scan ALL matching coins' to scan every coin."
+        )
     if news:
         st.warning("News risk is on: the minimum score is raised by 1. Check the calendar before entering.")
     need = min_score + (1 if news else 0)
