@@ -177,6 +177,24 @@ def cisd(d, side, recent=3, scan=12):
     return False
 
 
+def volatility_stats(d, n=14, er_n=40):
+    """Returns (ATR in price, ATR as % of price, efficiency ratio) from closed candles.
+    Efficiency ratio (ER) = net move / total path over the last er_n candles.
+    Near 1 = clean trend, near 0 = choppy sideways noise."""
+    h, l, c = d.high, d.low, d.close
+    pc = c.shift(1)
+    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    atr = float(tr.tail(n).mean())
+    price = float(c.iloc[-1])
+    atr_pct = atr / price * 100 if price > 0 else 0.0
+    er = 0.0
+    if len(c) > er_n:
+        net = abs(float(c.iloc[-1]) - float(c.iloc[-1 - er_n]))
+        path = float(c.diff().abs().tail(er_n).sum())
+        er = net / path if path > 0 else 0.0
+    return atr, atr_pct, er
+
+
 def analyze_tf(hd, bias, prox, k):
     """Best OB (bullish or bearish) near the current price on one timeframe, or None.
     hd = candles including the current unfinished one."""
@@ -222,9 +240,11 @@ def analyze_tf(hd, bias, prox, k):
     rng_lo = float(closed.low.tail(100).min())
     pos = (((lo + hi) / 2 - rng_lo) / (rng_hi - rng_lo) * 100) if rng_hi > rng_lo else 50.0
     pd_ok = (side == "bull" and pos <= 50) or (side == "bear" and pos > 50)
+    atr, atr_pct, er = volatility_stats(closed)
+    zone_atr = (hi - lo) / atr if atr > 0 else 0.0
     return {"side": side, "lo": lo, "hi": hi, "dist": dist, "brk_ago": n - 1 - j, "sigs": sigs,
             "score": score, "pd_zone": "Premium" if pos > 50 else "Discount", "pos": pos,
-            "pd_ok": pd_ok, "price": price}
+            "pd_ok": pd_ok, "price": price, "er": er, "atr_pct": atr_pct, "zone_atr": zone_atr}
 
 
 def norm(base):
@@ -319,6 +339,11 @@ use_dxy = c6.checkbox("Use DXY filter", True)
 only_bn = c6.checkbox("Only coins also on Binance Futures", True)
 only_pd = c6.checkbox("Only OBs on the correct side (bull OB in Discount, bear OB in Premium)", False)
 news = c6.checkbox("High-impact news today (stricter)", False)
+
+c7, c8, c9 = st.columns(3)
+min_er = c7.slider("Min trend efficiency (0 = off, higher = cleaner trend)", 0.0, 0.6, 0.2, 0.05)
+min_zone_atr = c8.slider("Min OB zone size (in ATR, 0 = off)", 0.0, 3.0, 1.0, 0.25)
+min_atr_pct = c9.slider("Min ATR % per candle (0 = off)", 0.0, 3.0, 0.0, 0.1)
 
 st.subheader("Market overview: BTC + Dollar index")
 o1, o2, o3 = st.columns(3)
@@ -424,6 +449,9 @@ if st.button("Scan", type="primary"):
                 r = analyze_tf(hd, bias, prox, swing_k)
                 if not r:
                     continue  # no OB near price on this timeframe
+                # skip choppy / sleepy coins
+                if r["er"] < min_er or r["zone_atr"] < min_zone_atr or r["atr_pct"] < min_atr_pct:
+                    continue
                 adj = 0 if dxy is None else (1 if dxy != r["side"] else -1)
                 rows.append({
                     "Coin": ex.markets[s]["base"],
@@ -439,6 +467,9 @@ if st.button("Scan", type="primary"):
                     "Dist %": round(r["dist"], 2),
                     "Break (candles ago)": r["brk_ago"],
                     "Price": r["price"],
+                    "Trend (ER)": round(r["er"], 2),
+                    "ATR %": round(r["atr_pct"], 2),
+                    "Zone/ATR": round(r["zone_atr"], 1),
                     "base": r["score"],
                     "dxy_adj": adj,
                     "pd_ok": r["pd_ok"],
@@ -471,7 +502,7 @@ if res:
             df = df[df["pd_ok"]]
         df = df[df["Score"] >= need].sort_values(["Score", "Dist %"], ascending=[False, True])
         cols = ["Coin", "Score", "Daily bias", "Bias basis", "OB type", "OB TF", "Premium/Discount",
-                "PD fit", "Setup", "Confirmations", "OB zone", "Dist %", "Break (candles ago)", "Price"]
+                "PD fit", "Setup", "Confirmations", "OB zone", "Dist %", "Break (candles ago)", "Price", "Trend (ER)", "ATR %", "Zone/ATR"]
         if df.empty:
             st.info("No coins reached the minimum score. Lower it or rescan later.")
         else:
@@ -508,6 +539,13 @@ with st.expander("📖 Terms explained (අර්ථ විස්තර)"):
 - **FVG near OB**: OB එකේ දිශාවටම ගැළපෙන FVG එකක් OB කලාපය ඇතුළේ හෝ ඊට මිලෙන් 1% ඇතුළත තියෙනවා නම්.
 - **Score**: OB (zone එකට ළඟ) +2, මිල zone එක ඇතුළේ නම් +3. Turtle soup +2, CISD +2, FVG near OB +1. DXY filter එක on නම්: OB එකේ දිශාවට (Bullish OB = long, Bearish OB = short) DXY ගැළපෙනවා නම් (උදා: Bullish OB, DXY Bearish) +1, ගැළපෙන්නේ නැත්නම් -1. ලකුණු වැඩි = ඔයාගේ rules වලට වැඩියෙන් ගැළපෙනවා, ඒත් ජයග්‍රහණයක් සහතික කරන්නේ නැහැ.
 - **Minimum score**: මේ ලකුණට වඩා අඩු coins ලැයිස්තුවෙන් අයින් කරනවා. "High-impact news today" ටික් කළොත් අවශ්‍ය අවම ලකුණ 1කින් වැඩි වෙනවා.
+
+### 4b. Choppy / sideways coins අයින් කරන filters
+- **ප්‍රශ්නය**: සමහර coins එක තැනක ගොඩ වෙලා sideways යනවා, පොඩි පොඩි movement විතරයි දෙන්නේ. එහෙම coin එකක OB එකක් ගත්තාම stop loss එක hit වෙනවා, ආපහු profit පැත්තට යනවා, ආපහු stop loss hit වෙනවා. මේ filters තුනෙන් ඒ වගේ coins ලැයිස්තුවෙන් අයින් කරනවා.
+- **Trend (ER) = Efficiency Ratio**: අන්තිම candles 40 තුළ මිල ඇත්තටම ගියපු දුර (මුල සිට අගට) බෙදන්නේ මිල ඉහළ පහළ ගිහින් ගියපු මුළු දුරින්. **1ට ළඟ** = පිරිසිදු trend එකක්, **0ට ළඟ** = අතන මෙතන හැමතැනම ගිහින් ආපහු ආවා (choppy). ඔයාගේ "Min trend efficiency" slider එකේ default 0.2. ඊට අඩු coins අයින් වෙනවා. තවත් strict වෙන්න ඕන නම් 0.3 දක්වා වැඩි කරන්න.
+- **Zone/ATR**: OB zone එකේ උස, සාමාන්‍ය candle එකක සරල ප්‍රමාණයෙන් (ATR) කීයෙන් එකක්ද කියන එක. 1ට අඩු නම් zone එක candle එකකටත් වඩා පොඩියි, stop loss එක noise එකටම වැදෙනවා. "Min OB zone size" default 1.0.
+- **ATR %**: candle එකක සාමාන්‍ය ප්‍රමාණය මිලෙන් %ක් විදිහට. අඩු = coin එක නිදිමතයි. "Min ATR % per candle" default 0 (off). Timeframe එක අනුව ප්‍රමාණය වෙනස් වෙනවා (4H එකේ සාමාන්‍යයෙන් 1-3%, 5m එකේ 0.2-0.4%), ඒ නිසා ඒක පාවිච්චි කරනවා නම් timeframe එකට ගැළපෙන අගයක් දාන්න.
+- වැදගත්: මේ filters වලින් trend එකක් **සහතික** වෙන්නේ නැහැ, choppy වෙන්න වැඩි ඉඩ තියෙන coins අඩු කරනවා විතරයි. ඒ filters 0 කළොත් කලින් වගේම හැම coin එකක්ම එනවා.
 
 ### 5. Settings (පාලන)
 - **Exchange (data source)**: දත්ත ගන්න තැන. Binance Futures server එක block වෙන්න පුළුවන්. OKX Perpetual වැඩ කරනවා.
