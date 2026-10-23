@@ -343,7 +343,7 @@ top_n = c3.slider("Coins to scan (top by volume)", 20, 600, 50, 10, disabled=sca
 
 c4, c5, c6 = st.columns(3)
 prox = c4.slider("Max distance to OB zone (%)", 0.5, 10.0, 3.0, 0.5)
-min_vol = c4.slider("Min 24h volume (million USD, 0 = no limit)", 0, 500, 0)
+min_vol = c4.slider("Min 24h volume (million USD, 0 = no limit)", 0, 500, 100)
 min_score = c5.slider("Minimum score", 1, 9, 3)
 swing_k = c5.slider("Swing sensitivity (candles on each side)", 1, 5, 2)
 use_dxy = c6.checkbox("Use DXY filter", True)
@@ -355,6 +355,9 @@ c7, c8, c9 = st.columns(3)
 min_er = c7.slider("Min trend efficiency (0 = off, higher = cleaner trend)", 0.0, 0.6, 0.2, 0.05)
 min_zone_atr = c8.slider("Min OB zone size (in ATR, 0 = off)", 0.0, 3.0, 1.0, 0.25)
 min_atr_pct = c9.slider("Min ATR % per candle (0 = off)", 0.0, 3.0, 0.0, 0.1)
+
+c10, c11, c12 = st.columns(3)
+min_chg = c10.slider("Min move from today's open (± %, 0 = off)", 0.0, 20.0, 5.0, 0.5)
 
 st.subheader("Market overview: BTC + Dollar index")
 o1, o2, o3 = st.columns(3)
@@ -446,7 +449,7 @@ if st.button("Scan", type="primary"):
         st.stop()
 
     dxy = dxy_bias()
-    rows, fails = [], 0
+    rows, fails, skipped_chg = [], 0, 0
     bar = st.progress(0.0)
     for i, s in enumerate(syms):
         bar.progress((i + 1) / len(syms), text=s)
@@ -456,6 +459,11 @@ if st.button("Scan", type="primary"):
                 continue
             # skip pegged / stable-like assets (price barely moves over 60 days)
             if (dd.high.max() - dd.low.min()) / dd.close.iloc[-1] < 0.05:
+                continue
+            # change from today's daily open (like TradingView "Chg from open")
+            chg_open = (float(dd.close.iloc[-1]) / float(dd.open.iloc[-1]) - 1) * 100
+            if abs(chg_open) < min_chg:
+                skipped_chg += 1
                 continue
             bias, why = daily_bias(dd)
             for name in tf_choice:
@@ -483,6 +491,7 @@ if st.button("Scan", type="primary"):
                     "Dist %": round(r["dist"], 2),
                     "Break (candles ago)": r["brk_ago"],
                     "Price": r["price"],
+                    "Chg from open %": round(chg_open, 2),
                     "Trend (ER)": round(r["er"], 2),
                     "ATR %": round(r["atr_pct"], 2),
                     "Zone/ATR": round(r["zone_atr"], 1),
@@ -498,6 +507,7 @@ if st.button("Scan", type="primary"):
         "bn": bn is not None, "dxy": dxy,
         "n_ex": n_ex, "n_bn": len(bn) if bn is not None else None, "n_match": n_match, "n_vol": n_vol,
         "min_vol": min_vol, "scan_all": scan_all, "top_n": top_n,
+        "min_chg": min_chg, "skipped_chg": skipped_chg,
         "time": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"),
     }
 
@@ -514,6 +524,11 @@ if res:
         + f" | common / after Binance filter = {res['n_match']}"
         + f" | after volume filter (min {res['min_vol']}M) = {res['n_vol']} | actually scanned = {res['n']}"
     )
+    if res["min_chg"] > 0:
+        st.caption(
+            f"Move-from-open filter (± {res['min_chg']}%): removed {res['skipped_chg']} of {res['n']} coins "
+            "before the OB check."
+        )
     if res["n_vol"] < res["n_match"]:
         st.warning(
             f"Min 24h volume ({res['min_vol']}M USD) removed {res['n_match'] - res['n_vol']} coins. "
@@ -536,7 +551,7 @@ if res:
             df = df[df["pd_ok"]]
         df = df[df["Score"] >= need].sort_values(["Score", "Dist %"], ascending=[False, True])
         cols = ["Coin", "Score", "Daily bias", "Bias basis", "OB type", "OB TF", "Premium/Discount",
-                "PD fit", "Setup", "Confirmations", "OB zone", "Dist %", "Break (candles ago)", "Price", "Trend (ER)", "ATR %", "Zone/ATR"]
+                "PD fit", "Setup", "Confirmations", "OB zone", "Dist %", "Break (candles ago)", "Price", "Chg from open %", "Trend (ER)", "ATR %", "Zone/ATR"]
         if df.empty:
             st.info("No coins reached the minimum score. Lower it or rescan later.")
         else:
@@ -580,6 +595,12 @@ with st.expander("📖 Terms explained (අර්ථ විස්තර)"):
 - **Zone/ATR**: OB zone එකේ උස, සාමාන්‍ය candle එකක සරල ප්‍රමාණයෙන් (ATR) කීයෙන් එකක්ද කියන එක. 1ට අඩු නම් zone එක candle එකකටත් වඩා පොඩියි, stop loss එක noise එකටම වැදෙනවා. "Min OB zone size" default 1.0.
 - **ATR %**: candle එකක සාමාන්‍ය ප්‍රමාණය මිලෙන් %ක් විදිහට. අඩු = coin එක නිදිමතයි. "Min ATR % per candle" default 0 (off). Timeframe එක අනුව ප්‍රමාණය වෙනස් වෙනවා (4H එකේ සාමාන්‍යයෙන් 1-3%, 5m එකේ 0.2-0.4%), ඒ නිසා ඒක පාවිච්චි කරනවා නම් timeframe එකට ගැළපෙන අගයක් දාන්න.
 - වැදගත්: මේ filters වලින් trend එකක් **සහතික** වෙන්නේ නැහැ, choppy වෙන්න වැඩි ඉඩ තියෙන coins අඩු කරනවා විතරයි. ඒ filters 0 කළොත් කලින් වගේම හැම coin එකක්ම එනවා.
+
+### 4c. Min move from today's open (TradingView "Chg from open")
+- අද දවසේ daily candle එකේ **open** මිලට වඩා දැන් මිල % කීයකින් වෙනස් වෙලාද කියන එක. TradingView screener එකේ "Chg from open outside -5% to 5%" කියන්නේ මේකමයි.
+- **Min move from today's open** slider එක 5 කළොත්, අද open එකෙන් 5%ට වඩා ඉහළට හෝ පහළට ගිය coins විතරක් OB check එකට යනවා. 0 නම් මේ filter එක off.
+- Results table එකේ **Chg from open %** column එකෙන් ඒ අගය පෙනෙනවා (+ = ඉහළට, − = පහළට).
+- මේ filter එක OB timeframes scan කරන්න **කලින්** වැඩ කරන නිසා scan එක ඉක්මන් වෙනවා.
 
 ### 5. Settings (පාලන)
 - **Exchange (data source)**: දත්ත ගන්න තැන. Binance Futures server එක block වෙන්න පුළුවන්. OKX Perpetual වැඩ කරනවා.
