@@ -1,4 +1,5 @@
 streamlit
 ccxt
 pandas
+requests
 yfinance
