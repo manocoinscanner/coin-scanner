@@ -253,17 +253,23 @@ def norm(base):
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def binance_futures_bases():
-    """Coins with a Binance USDT perpetual. Binance's own API is blocked from this server,
-    so the list comes from CoinGecko (cached for 6 hours)."""
-    try:  # first choice: the full market list straight from Binance
+def binance_futures_info():
+    """Coins with a Binance USDT perpetual as {coin: 24h volume in USD}.
+    If Binance's own API is blocked from this server, the list and volumes come from
+    CoinGecko instead (cached for 6 hours)."""
+    try:  # first choice: straight from Binance
         bx = ccxt.binanceusdm({"enableRateLimit": True})
         bx.load_markets()
-        got = {norm(m["base"]) for m in bx.markets.values()
-               if m.get("swap") and m.get("linear") and m.get("quote") == "USDT"
-               and m.get("settle") == "USDT" and m.get("active") is not False}
+        tk = bx.fetch_tickers()
+        got = {}
+        for sym, m in bx.markets.items():
+            if (m.get("swap") and m.get("linear") and m.get("quote") == "USDT"
+                    and m.get("settle") == "USDT" and m.get("active") is not False):
+                v = (tk.get(sym) or {}).get("quoteVolume")
+                key = norm(m["base"])
+                got[key] = max(got.get(key, 0.0), float(v or 0))
         if len(got) > 100:
-            return sorted(got)
+            return got
     except Exception:
         pass
     r = requests.get(
@@ -273,11 +279,13 @@ def binance_futures_bases():
         timeout=30,
     )
     r.raise_for_status()
-    out = set()
+    out = {}
     for t in r.json().get("tickers", []):
         if t.get("target") == "USDT" and t.get("contract_type", "perpetual") == "perpetual":
-            out.add(norm(t["base"]))
-    return sorted(out)
+            usd = (t.get("converted_volume") or {}).get("usd")
+            key = norm(t["base"])
+            out[key] = max(out.get(key, 0.0), float(usd or 0))
+    return out
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -416,7 +424,7 @@ if st.button("Scan", type="primary"):
     bn = None
     if only_bn and exch != "binanceusdm":
         try:
-            bn = set(binance_futures_bases())
+            bn = binance_futures_info()  # {coin: Binance 24h USD volume}
         except Exception as e:
             st.error(
                 f"Could not get the Binance Futures coin list: {e}. "
@@ -426,6 +434,7 @@ if st.button("Scan", type="primary"):
 
     pairs = []
     n_ex = 0  # USDT perpetuals on the chosen exchange
+    n_bn_vol = 0  # coins whose volume came from Binance
     for s, m in ex.markets.items():
         if (m.get("swap") and m.get("linear") and m.get("quote") == "USDT"
                 and m.get("settle") == "USDT" and m.get("active") is not False
@@ -434,9 +443,15 @@ if st.button("Scan", type="primary"):
             if bn is not None and norm(m["base"]) not in bn:
                 continue
             t = tick[s]
-            vol = t.get("quoteVolume")
-            if not vol and t.get("baseVolume") and t.get("last"):
-                vol = t["baseVolume"] * t["last"]
+            vol = None
+            if bn is not None:
+                vol = bn.get(norm(m["base"]))  # Binance 24h volume in USD
+                if vol:
+                    n_bn_vol += 1
+            if not vol:  # no Binance volume for this coin: use the exchange's own number
+                vol = t.get("quoteVolume")
+                if not vol and t.get("baseVolume") and t.get("last"):
+                    vol = t["baseVolume"] * t["last"]
             pairs.append((float(vol or 0), s))
     n_match = len(pairs)  # coins left after the Binance filter
     if any(v > 0 for v, _ in pairs):  # volume data available: keep liquid coins only
@@ -507,7 +522,7 @@ if st.button("Scan", type="primary"):
         "bn": bn is not None, "dxy": dxy,
         "n_ex": n_ex, "n_bn": len(bn) if bn is not None else None, "n_match": n_match, "n_vol": n_vol,
         "min_vol": min_vol, "scan_all": scan_all, "top_n": top_n,
-        "min_chg": min_chg, "skipped_chg": skipped_chg,
+        "min_chg": min_chg, "skipped_chg": skipped_chg, "n_bn_vol": n_bn_vol,
         "time": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"),
     }
 
@@ -524,6 +539,11 @@ if res:
         + f" | common / after Binance filter = {res['n_match']}"
         + f" | after volume filter (min {res['min_vol']}M) = {res['n_vol']} | actually scanned = {res['n']}"
     )
+    if res["n_bn"] is not None:
+        st.caption(
+            f"Volume source: Binance 24h volume used for {res['n_bn_vol']} of {res['n_match']} common coins "
+            "(the rest use the data-source exchange's own volume). Candles come from the data-source exchange."
+        )
     if res["min_chg"] > 0:
         st.caption(
             f"Move-from-open filter (± {res['min_chg']}%): removed {res['skipped_chg']} of {res['n']} coins "
