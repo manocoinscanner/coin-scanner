@@ -478,7 +478,149 @@ if btc and dxy_i:
     else:
         o3.info("BTC සහ DXY සංඥා මිශ්‍රයි (එකිනෙකට ගැළපෙන්නේ නැහැ). ප්‍රවේශම් වන්න, ලකුණු අඩු coins මගහරින්න.")
 
-tab_scan, tab_search = st.tabs(["📊 Coin Scan", "🔎 Coin Search"])
+def run_scan():
+    """Runs the full coin scan with the current settings and stores it in session_state["res"]."""
+    if not tf_choice:
+        st.warning("Select at least one OB timeframe.")
+        st.stop()
+    try:
+        ex = make_ex(exch)
+        ex.load_markets()
+        tick = ex.fetch_tickers()
+    except Exception as e:
+        st.error(f"Could not get data from {exch_name}: {e}. Try another exchange.")
+        st.stop()
+
+    bn = None
+    if only_bn or (fallback and exch == "okx"):
+        try:
+            bn = binance_futures_info()  # {coin: Binance 24h USD volume}
+        except Exception as e:
+            st.error(
+                f"Could not get the Binance Futures coin list: {e}. "
+                "Wait a minute and scan again, or untick the Binance filter."
+            )
+            st.stop()
+
+    pairs = []
+    n_ex = 0  # USDT perpetuals on the chosen exchange
+    n_bn_vol = 0  # coins whose volume came from Binance
+    for s, m in ex.markets.items():
+        if (m.get("swap") and m.get("linear") and m.get("quote") == "USDT"
+                and m.get("settle") == "USDT" and m.get("active") is not False
+                and m.get("base") not in STABLES and s in tick):
+            n_ex += 1
+            if only_bn and bn is not None and norm(m["base"]) not in bn:
+                continue
+            t = tick[s]
+            vol = None
+            if bn is not None:
+                vol = bn.get(norm(m["base"]))  # Binance 24h volume in USD
+                if vol:
+                    n_bn_vol += 1
+            if not vol:  # no Binance volume for this coin: use the exchange's own number
+                vol = t.get("quoteVolume")
+                if not vol and t.get("baseVolume") and t.get("last"):
+                    vol = t["baseVolume"] * t["last"]
+            pairs.append((float(vol or 0), s))
+    n_fb = 0  # coins taken from Binance Spot because OKX does not list them
+    if fallback and exch == "okx" and bn is not None:
+        okx_bases = {norm(m["base"]) for m in ex.markets.values()
+                     if m.get("swap") and m.get("linear") and m.get("quote") == "USDT"}
+        try:
+            spot_tick = BinanceSpot().fetch_tickers()
+        except Exception:
+            spot_tick = {}
+        for key, bvol in bn.items():
+            ssym = key + "USDT"
+            if key in okx_bases or key in STABLES or ssym not in spot_tick:
+                continue
+            pairs.append((float(bvol or spot_tick[ssym]["quoteVolume"] or 0), "SPOT:" + ssym))
+            n_fb += 1
+    n_match = len(pairs)  # coins left after the Binance filter
+    if any(v > 0 for v, _ in pairs):  # volume data available: keep liquid coins only
+        pairs = [p for p in pairs if p[0] >= min_vol * 1_000_000]
+    n_vol = len(pairs)  # coins left after the volume filter
+    ranked = [s for _, s in sorted(pairs, reverse=True)]
+    syms = ranked if scan_all else ranked[:top_n]
+    if not syms:
+        st.error("No coins matched the filters. Lower the minimum volume or untick the Binance filter.")
+        st.stop()
+
+    dxy = dxy_bias()
+    spot_ex = BinanceSpot()
+    rows, fails, skipped_chg = [], 0, 0
+    bar = st.progress(0.0)
+    for i, s in enumerate(syms):
+        bar.progress((i + 1) / len(syms), text=s)
+        is_spot = s.startswith("SPOT:")
+        exs = spot_ex if is_spot else ex
+        real = s[5:] if is_spot else s
+        try:
+            dd = candles(exs, real, "1d", 60)
+            if len(dd) < 25:
+                continue
+            # skip pegged / stable-like assets (price barely moves over 60 days)
+            if (dd.high.max() - dd.low.min()) / dd.close.iloc[-1] < 0.05:
+                continue
+            # change from today's daily open (like TradingView "Chg from open")
+            chg_open = (float(dd.close.iloc[-1]) / float(dd.open.iloc[-1]) - 1) * 100
+            if abs(chg_open) < min_chg:
+                skipped_chg += 1
+                continue
+            bias, why = daily_bias(dd)
+            for name in tf_choice:
+                hd = candles(exs, real, TF_MAP[name], 300)
+                if len(hd) < 60:
+                    continue
+                r = analyze_tf(hd, bias, prox, swing_k)
+                if not r:
+                    continue  # no OB near price on this timeframe
+                # skip choppy / sleepy coins
+                if r["er"] < min_er or r["zone_atr"] < min_zone_atr or r["atr_pct"] < min_atr_pct:
+                    continue
+                adj = 0 if dxy is None else (1 if dxy != r["side"] else -1)
+                rows.append({
+                    "Coin": real[:-4] if is_spot else ex.markets[s]["base"],
+                    "Data": "Binance Spot" if (is_spot or exch == "binancespot") else "OKX",
+                    "Daily bias": "🟢 Bullish" if bias == "bull" else "🔴 Bearish",
+                    "Bias basis": why,
+                    "OB type": "🟢 Bullish OB" if r["side"] == "bull" else "🔴 Bearish OB",
+                    "OB TF": name,
+                    "Premium/Discount": f"{r['pd_zone']} ({r['pos']:.0f}%)",
+                    "PD fit": "✅ Correct side" if r["pd_ok"] else "⚠️ Wrong side",
+                    "Setup": "With bias" if r["side"] == bias else "Pullback (against bias)",
+                    "Confirmations": ", ".join(r["sigs"]) or "-",
+                    "OB zone": f"{r['lo']:.6g} – {r['hi']:.6g}",
+                    "Dist %": round(r["dist"], 2),
+                    "Break (candles ago)": r["brk_ago"],
+                    "Price": r["price"],
+                    "Chg from open %": round(chg_open, 2),
+                    "ob_lo": r["lo"],
+                    "ob_hi": r["hi"],
+                    "Trend (ER)": round(r["er"], 2),
+                    "ATR %": round(r["atr_pct"], 2),
+                    "Zone/ATR": round(r["zone_atr"], 1),
+                    "base": r["score"],
+                    "dxy_adj": adj,
+                    "pd_ok": r["pd_ok"],
+                })
+        except Exception:
+            fails += 1
+    bar.empty()
+    st.session_state["res"] = {
+        "rows": rows, "fails": fails, "n": len(syms), "exch": exch_name, "tfs": list(tf_choice),
+        "bn": only_bn, "dxy": dxy,
+        "n_ex": n_ex, "n_bn": len(bn) if bn is not None else None, "n_match": n_match, "n_vol": n_vol,
+        "min_vol": min_vol, "scan_all": scan_all, "top_n": top_n,
+        "min_chg": min_chg, "skipped_chg": skipped_chg, "n_bn_vol": n_bn_vol, "n_fb": n_fb,
+        "time": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"),
+    }
+
+
+
+prog_box = st.container()  # scan progress and messages show here, above the tabs
+tab_scan, tab_entry, tab_search = st.tabs(["📊 Coin Scan", "🎯 Entry Ready", "🔎 Coin Search"])
 
 with tab_search:
     st.caption("Type a coin name to see its details. It uses the same settings as the scanner above.")
@@ -553,142 +695,25 @@ with tab_search:
             st.error(f"Could not check {one}: {e}")
 
 with tab_scan:
-    if st.button("Scan", type="primary"):
-        if not tf_choice:
-            st.warning("Select at least one OB timeframe.")
-            st.stop()
-        try:
-            ex = make_ex(exch)
-            ex.load_markets()
-            tick = ex.fetch_tickers()
-        except Exception as e:
-            st.error(f"Could not get data from {exch_name}: {e}. Try another exchange.")
-            st.stop()
+    scan_clicked = st.button("Scan", type="primary")
 
-        bn = None
-        if only_bn or (fallback and exch == "okx"):
-            try:
-                bn = binance_futures_info()  # {coin: Binance 24h USD volume}
-            except Exception as e:
-                st.error(
-                    f"Could not get the Binance Futures coin list: {e}. "
-                    "Wait a minute and scan again, or untick the Binance filter."
-                )
-                st.stop()
+with tab_entry:
+    st.subheader("Entry-ready coins")
+    st.caption("Coins that match ALL your settings AND the entry rules below right now. "
+               "Untick a rule to make the list looser.")
+    e1, e2 = st.columns(2)
+    e_inside = e1.checkbox("Price is inside the OB zone now", True)
+    e_bias = e1.checkbox("OB direction matches the daily bias", True)
+    e_pd = e1.checkbox("OB is on the correct Premium/Discount side", True)
+    e_conf = e2.checkbox("At least one confirmation (Turtle soup / CISD / FVG)", True)
+    e_dxy = e2.checkbox("DXY supports the direction", True)
+    entry_clicked = st.button("Find entries now", type="primary")
 
-        pairs = []
-        n_ex = 0  # USDT perpetuals on the chosen exchange
-        n_bn_vol = 0  # coins whose volume came from Binance
-        for s, m in ex.markets.items():
-            if (m.get("swap") and m.get("linear") and m.get("quote") == "USDT"
-                    and m.get("settle") == "USDT" and m.get("active") is not False
-                    and m.get("base") not in STABLES and s in tick):
-                n_ex += 1
-                if only_bn and bn is not None and norm(m["base"]) not in bn:
-                    continue
-                t = tick[s]
-                vol = None
-                if bn is not None:
-                    vol = bn.get(norm(m["base"]))  # Binance 24h volume in USD
-                    if vol:
-                        n_bn_vol += 1
-                if not vol:  # no Binance volume for this coin: use the exchange's own number
-                    vol = t.get("quoteVolume")
-                    if not vol and t.get("baseVolume") and t.get("last"):
-                        vol = t["baseVolume"] * t["last"]
-                pairs.append((float(vol or 0), s))
-        n_fb = 0  # coins taken from Binance Spot because OKX does not list them
-        if fallback and exch == "okx" and bn is not None:
-            okx_bases = {norm(m["base"]) for m in ex.markets.values()
-                         if m.get("swap") and m.get("linear") and m.get("quote") == "USDT"}
-            try:
-                spot_tick = BinanceSpot().fetch_tickers()
-            except Exception:
-                spot_tick = {}
-            for key, bvol in bn.items():
-                ssym = key + "USDT"
-                if key in okx_bases or key in STABLES or ssym not in spot_tick:
-                    continue
-                pairs.append((float(bvol or spot_tick[ssym]["quoteVolume"] or 0), "SPOT:" + ssym))
-                n_fb += 1
-        n_match = len(pairs)  # coins left after the Binance filter
-        if any(v > 0 for v, _ in pairs):  # volume data available: keep liquid coins only
-            pairs = [p for p in pairs if p[0] >= min_vol * 1_000_000]
-        n_vol = len(pairs)  # coins left after the volume filter
-        ranked = [s for _, s in sorted(pairs, reverse=True)]
-        syms = ranked if scan_all else ranked[:top_n]
-        if not syms:
-            st.error("No coins matched the filters. Lower the minimum volume or untick the Binance filter.")
-            st.stop()
+if scan_clicked or entry_clicked:
+    with prog_box:
+        run_scan()
 
-        dxy = dxy_bias()
-        spot_ex = BinanceSpot()
-        rows, fails, skipped_chg = [], 0, 0
-        bar = st.progress(0.0)
-        for i, s in enumerate(syms):
-            bar.progress((i + 1) / len(syms), text=s)
-            is_spot = s.startswith("SPOT:")
-            exs = spot_ex if is_spot else ex
-            real = s[5:] if is_spot else s
-            try:
-                dd = candles(exs, real, "1d", 60)
-                if len(dd) < 25:
-                    continue
-                # skip pegged / stable-like assets (price barely moves over 60 days)
-                if (dd.high.max() - dd.low.min()) / dd.close.iloc[-1] < 0.05:
-                    continue
-                # change from today's daily open (like TradingView "Chg from open")
-                chg_open = (float(dd.close.iloc[-1]) / float(dd.open.iloc[-1]) - 1) * 100
-                if abs(chg_open) < min_chg:
-                    skipped_chg += 1
-                    continue
-                bias, why = daily_bias(dd)
-                for name in tf_choice:
-                    hd = candles(exs, real, TF_MAP[name], 300)
-                    if len(hd) < 60:
-                        continue
-                    r = analyze_tf(hd, bias, prox, swing_k)
-                    if not r:
-                        continue  # no OB near price on this timeframe
-                    # skip choppy / sleepy coins
-                    if r["er"] < min_er or r["zone_atr"] < min_zone_atr or r["atr_pct"] < min_atr_pct:
-                        continue
-                    adj = 0 if dxy is None else (1 if dxy != r["side"] else -1)
-                    rows.append({
-                        "Coin": real[:-4] if is_spot else ex.markets[s]["base"],
-                        "Data": "Binance Spot" if (is_spot or exch == "binancespot") else "OKX",
-                        "Daily bias": "🟢 Bullish" if bias == "bull" else "🔴 Bearish",
-                        "Bias basis": why,
-                        "OB type": "🟢 Bullish OB" if r["side"] == "bull" else "🔴 Bearish OB",
-                        "OB TF": name,
-                        "Premium/Discount": f"{r['pd_zone']} ({r['pos']:.0f}%)",
-                        "PD fit": "✅ Correct side" if r["pd_ok"] else "⚠️ Wrong side",
-                        "Setup": "With bias" if r["side"] == bias else "Pullback (against bias)",
-                        "Confirmations": ", ".join(r["sigs"]) or "-",
-                        "OB zone": f"{r['lo']:.6g} – {r['hi']:.6g}",
-                        "Dist %": round(r["dist"], 2),
-                        "Break (candles ago)": r["brk_ago"],
-                        "Price": r["price"],
-                        "Chg from open %": round(chg_open, 2),
-                        "Trend (ER)": round(r["er"], 2),
-                        "ATR %": round(r["atr_pct"], 2),
-                        "Zone/ATR": round(r["zone_atr"], 1),
-                        "base": r["score"],
-                        "dxy_adj": adj,
-                        "pd_ok": r["pd_ok"],
-                    })
-            except Exception:
-                fails += 1
-        bar.empty()
-        st.session_state["res"] = {
-            "rows": rows, "fails": fails, "n": len(syms), "exch": exch_name, "tfs": list(tf_choice),
-            "bn": only_bn, "dxy": dxy,
-            "n_ex": n_ex, "n_bn": len(bn) if bn is not None else None, "n_match": n_match, "n_vol": n_vol,
-            "min_vol": min_vol, "scan_all": scan_all, "top_n": top_n,
-            "min_chg": min_chg, "skipped_chg": skipped_chg, "n_bn_vol": n_bn_vol, "n_fb": n_fb,
-            "time": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"),
-        }
-
+with tab_scan:
     res = st.session_state.get("res")
     if res:
         st.caption(
@@ -741,6 +766,43 @@ with tab_scan:
             else:
                 st.dataframe(df[cols], hide_index=True)
 
+with tab_entry:
+    eres = st.session_state.get("res")
+    if not eres:
+        st.info("Press 'Find entries now' (or run a Coin Scan) first.")
+    else:
+        st.caption(f"Based on the scan of {eres['n']} coins on {eres['exch']} at {eres['time']} UTC | "
+                   f"OB timeframes: {', '.join(eres['tfs'])}")
+        edf = pd.DataFrame(eres["rows"])
+        if edf.empty:
+            st.info("The scan found no coin with an OB near the price.")
+        else:
+            edf["Score"] = edf["base"] + (edf["dxy_adj"] if use_dxy else 0)
+            edf = edf[edf["Score"] >= min_score + (1 if news else 0)]
+            if e_inside:
+                edf = edf[edf["Dist %"] == 0]
+            if e_bias:
+                edf = edf[edf["Setup"] == "With bias"]
+            if e_pd:
+                edf = edf[edf["pd_ok"]]
+            if e_conf:
+                edf = edf[edf["Confirmations"] != "-"]
+            if e_dxy and eres["dxy"] is not None:
+                edf = edf[edf["dxy_adj"] == 1]
+            if edf.empty:
+                st.info("No coin matches all the entry rules right now. Try again later, "
+                        "or untick some of the rules above.")
+            else:
+                edf = edf.sort_values(["Score", "Break (candles ago)"], ascending=[False, True]).copy()
+                edf["Direction"] = edf["OB type"].map(lambda t: "🟢 LONG" if "Bullish" in t else "🔴 SHORT")
+                edf["Invalidation"] = [f"{lo:.6g}" if "Bullish" in t else f"{hi:.6g}"
+                                       for lo, hi, t in zip(edf["ob_lo"], edf["ob_hi"], edf["OB type"])]
+                ecols = ["Coin", "Data", "Direction", "Score", "OB TF", "OB zone", "Price", "Invalidation",
+                         "Daily bias", "Premium/Discount", "Confirmations", "Chg from open %"]
+                st.dataframe(edf[ecols], hide_index=True)
+                st.caption("Invalidation = the far edge of the OB zone. A candle closing beyond it cancels that OB. "
+                           "Candidates only, not trade advice: confirm on the chart first.")
+
 with st.expander("📖 Terms explained (අර්ථ විස්තර)"):
     st.markdown(
         """
@@ -790,6 +852,13 @@ with st.expander("📖 Terms explained (අර්ථ විස්තර)"):
 - coin නම (උදා: BTC, SOL, PEPE) type කරලා **Check coin** එබුවාම, ඒ coin එකේ Daily bias, මිල, අද open එකෙන් වෙනස, සහ timeframe හතරේම (4H, 1H, 15m, 5m) ළඟම තියෙන OB එක පෙන්නනවා.
 - OB එක මිලෙන් දුරින් තිබුණත් පෙන්නනවා, ඒ නිසා ඒ coin එකේ OB එකක් තියෙනවද කියලා බලන්න පුළුවන්.
 - **Scanner** column එකෙන් කියන්නේ ඒ coin එක දැන් තියෙන filter settings වලට අනුව scan එකේ ලැයිස්තුවට එනවද කියලයි. ✅ නම් එනවා. ❌ නම් ඒකට හේතුව (OB එකෙන් දුරයි, choppy, score අඩුයි, ආදිය) පෙන්නනවා. Scan එකේ coin එකක් නොපෙනුණොත් ඒකට හේතුව දැනගන්න මේක පාවිච්චි කරන්න.
+
+### 4e. Entry Ready page (දැන්ම entry එකක් ගන්න පුළුවන් coins)
+- **Find entries now** එබුවාම (හෝ Coin Scan එකක් කළාට පස්සේ) ඔයාගේ settings ඔක්කොමත්, පහළ entry rules වලටත් **එකවර ගැළපෙන** coins විතරක් පෙන්නනවා.
+- Entry rules (ටික් එක අයින් කළොත් ඒ rule එක නැතිව ලැයිස්තුව පුළුල් වෙනවා): **මිල OB zone එක ඇතුළේ**, **OB එකේ දිශාව Daily bias එකට ගැළපෙනවා**, **Premium/Discount හරි පැත්තේ**, **අඩුම තරමේ confirmation එකක්** (Turtle soup / CISD / FVG), **DXY දිශාවට හිතකරයි**.
+- **Direction**: Bullish OB = 🟢 LONG, Bearish OB = 🔴 SHORT. **Invalidation**: OB zone එකේ අනිත් කෙළවර (LONG නම් zone එකේ පහළ, SHORT නම් ඉහළ). candle එකක් ඒක ඉක්මවා close වුණොත් ඒ OB එක අවලංගුයි.
+- ලැයිස්තුව හිස් නම්, දැන් එහෙම coin එකක් නැහැ කියන එකයි. නැවත පස්සේ scan කරන්න, නැත්නම් rules ටික් අයින් කරන්න.
+- මේ candidates ලැයිස්තුවක් විතරයි, trade advice නෙවෙයි. chart එකේ තහවුරු කරගන්න.
 
 ### 5. Settings (පාලන)
 - **Exchange (data source)**: candles (OB, bias සඳහා) ගන්න තැන. **OKX Perpetual** (පළවෙනි, default) සහ **Binance Spot** තෝරන්න පුළුවන්. Binance Futures සහ Bybit අයින් කළා.
