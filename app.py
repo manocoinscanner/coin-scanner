@@ -1,5 +1,6 @@
 import datetime as dt
 import re
+import time
 
 import ccxt
 import pandas as pd
@@ -19,6 +20,80 @@ MAX_AGE = 150  # an OB counts only if its structure break happened within the la
 def candles(ex, sym, tf, limit):
     raw = ex.fetch_ohlcv(sym, tf, limit=limit)
     return pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "vol"])
+
+
+class BinanceSpot:
+    """Minimal Binance Spot market-data client (public data-api.binance.vision, no key needed).
+    It offers the few calls this app uses, so it can be used in place of a ccxt exchange."""
+    BASE = "https://data-api.binance.vision/api/v3"
+
+    def __init__(self):
+        self.markets = {}
+        self._tick = {}
+
+    def _get(self, path, params=None):
+        r = requests.get(self.BASE + path, params=params, timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    def fetch_tickers(self):
+        if self._tick:
+            return self._tick
+        for t in self._get("/ticker/24hr"):
+            sym = t["symbol"]
+            if not sym.endswith("USDT"):
+                continue
+            base = sym[:-4]
+            # same keys the OKX filter in the scanner looks for
+            self.markets[sym] = {"swap": True, "linear": True, "quote": "USDT", "settle": "USDT",
+                                 "active": True, "base": base}
+            self._tick[sym] = {"quoteVolume": float(t["quoteVolume"]), "baseVolume": float(t["volume"]),
+                               "last": float(t["lastPrice"])}
+        return self._tick
+
+    def load_markets(self):
+        if not self.markets:
+            self.fetch_tickers()
+        return self.markets
+
+    def fetch_ohlcv(self, sym, tf, limit=300):
+        time.sleep(0.05)  # stay well under Binance's request limits
+        rows = self._get("/klines", {"symbol": sym, "interval": tf, "limit": limit})
+        return [[r[0], float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])] for r in rows]
+
+
+def make_ex(exch):
+    """OKX perpetuals through ccxt, or Binance Spot through the small client above."""
+    if exch == "binancespot":
+        return BinanceSpot()
+    return getattr(ccxt, exch)({"enableRateLimit": True,
+                                "options": {"defaultType": "swap", "defaultSubType": "linear"}})
+
+
+def find_coin(exch, coin, fallback):
+    """Find a coin on the chosen exchange; if it is missing on OKX and fallback is on,
+    look for it on Binance Spot. Returns (exchange object, symbol, source key) or (None, None, None)."""
+    key = norm(coin)
+    try:
+        ex = make_ex(exch)
+        ex.load_markets()
+        for s, m in ex.markets.items():
+            if (m.get("swap") and m.get("linear") and m.get("quote") == "USDT"
+                    and m.get("settle") == "USDT" and m.get("active") is not False
+                    and norm(m["base"]) == key):
+                return ex, s, exch
+    except Exception:
+        pass
+    if exch == "okx" and fallback:
+        try:
+            sp = BinanceSpot()
+            sp.load_markets()
+            for s, m in sp.markets.items():
+                if norm(m["base"]) == key:
+                    return sp, s, "binancespot"
+        except Exception:
+            pass
+    return None, None, None
 
 
 def swings(d, k=2):
@@ -312,11 +387,8 @@ def dxy_bias():
 @st.cache_data(ttl=300, show_spinner=False)
 def btc_overview(exch, tfs, k, prox):
     """BTC daily bias plus the nearest OB on each selected timeframe."""
-    cfg = {"enableRateLimit": True}
-    if exch in ("okx", "bybit"):
-        cfg["options"] = {"defaultType": "swap", "defaultSubType": "linear"}
-    ex = getattr(ccxt, exch)(cfg)
-    sym = "BTC/USDT:USDT"
+    ex = make_ex(exch)
+    sym = "BTCUSDT" if exch == "binancespot" else "BTC/USDT:USDT"
     dd = candles(ex, sym, "1d", 60)
     bias, why = daily_bias(dd)
     done = dd.iloc[:-1]
@@ -337,9 +409,8 @@ def label(b):
 st.title("Coin Scanner")
 
 EXCHANGES = {
-    "Binance Futures (USDT-M)": "binanceusdm",
     "OKX Perpetual (USDT)": "okx",
-    "Bybit Perpetual (USDT)": "bybit",
+    "Binance Spot (USDT)": "binancespot",
 }
 
 c1, c2, c3 = st.columns(3)
@@ -356,6 +427,7 @@ min_score = c5.slider("Minimum score", 1, 9, 3)
 swing_k = c5.slider("Swing sensitivity (candles on each side)", 1, 5, 2)
 use_dxy = c6.checkbox("Use DXY filter", True)
 only_bn = c6.checkbox("Only coins also on Binance Futures", True)
+fallback = c6.checkbox("If a coin is not on OKX, check it on Binance Spot (auto)", True)
 only_pd = c6.checkbox("Only OBs on the correct side (bull OB in Discount, bear OB in Premium)", False)
 news = c6.checkbox("High-impact news today (stricter)", False)
 
@@ -417,21 +489,13 @@ with tab_search:
     check_one = sc2.button("Check coin")
     if check_one and one:
         try:
-            cfg = {"enableRateLimit": True}
-            if exch in ("okx", "bybit"):
-                cfg["options"] = {"defaultType": "swap", "defaultSubType": "linear"}
-            ex1 = getattr(ccxt, exch)(cfg)
-            ex1.load_markets()
-            sym = None
-            for s1, m1 in ex1.markets.items():
-                if (m1.get("swap") and m1.get("linear") and m1.get("quote") == "USDT"
-                        and m1.get("settle") == "USDT" and m1.get("active") is not False
-                        and norm(m1["base"]) == norm(one)):
-                    sym = s1
-                    break
+            ex1, sym, src1 = find_coin(exch, one, fallback)
             if sym is None:
-                st.warning(f"{one} USDT perpetual was not found on {exch_name}.")
+                st.warning(f"{one} was not found on {exch_name}"
+                           + (" or on Binance Spot." if fallback and exch == "okx" else "."))
             else:
+                if src1 != exch:
+                    st.info(f"{one} was not found on {exch_name}, so the data below comes from Binance Spot.")
                 dd1 = candles(ex1, sym, "1d", 60)
                 bias1, why1 = daily_bias(dd1)
                 price1 = float(dd1.close.iloc[-1])
@@ -494,10 +558,7 @@ with tab_scan:
             st.warning("Select at least one OB timeframe.")
             st.stop()
         try:
-            cfg = {"enableRateLimit": True}
-            if exch in ("okx", "bybit"):
-                cfg["options"] = {"defaultType": "swap", "defaultSubType": "linear"}
-            ex = getattr(ccxt, exch)(cfg)
+            ex = make_ex(exch)
             ex.load_markets()
             tick = ex.fetch_tickers()
         except Exception as e:
@@ -505,7 +566,7 @@ with tab_scan:
             st.stop()
 
         bn = None
-        if only_bn and exch != "binanceusdm":
+        if only_bn or (fallback and exch == "okx"):
             try:
                 bn = binance_futures_info()  # {coin: Binance 24h USD volume}
             except Exception as e:
@@ -523,7 +584,7 @@ with tab_scan:
                     and m.get("settle") == "USDT" and m.get("active") is not False
                     and m.get("base") not in STABLES and s in tick):
                 n_ex += 1
-                if bn is not None and norm(m["base"]) not in bn:
+                if only_bn and bn is not None and norm(m["base"]) not in bn:
                     continue
                 t = tick[s]
                 vol = None
@@ -536,6 +597,20 @@ with tab_scan:
                     if not vol and t.get("baseVolume") and t.get("last"):
                         vol = t["baseVolume"] * t["last"]
                 pairs.append((float(vol or 0), s))
+        n_fb = 0  # coins taken from Binance Spot because OKX does not list them
+        if fallback and exch == "okx" and bn is not None:
+            okx_bases = {norm(m["base"]) for m in ex.markets.values()
+                         if m.get("swap") and m.get("linear") and m.get("quote") == "USDT"}
+            try:
+                spot_tick = BinanceSpot().fetch_tickers()
+            except Exception:
+                spot_tick = {}
+            for key, bvol in bn.items():
+                ssym = key + "USDT"
+                if key in okx_bases or key in STABLES or ssym not in spot_tick:
+                    continue
+                pairs.append((float(bvol or spot_tick[ssym]["quoteVolume"] or 0), "SPOT:" + ssym))
+                n_fb += 1
         n_match = len(pairs)  # coins left after the Binance filter
         if any(v > 0 for v, _ in pairs):  # volume data available: keep liquid coins only
             pairs = [p for p in pairs if p[0] >= min_vol * 1_000_000]
@@ -547,12 +622,16 @@ with tab_scan:
             st.stop()
 
         dxy = dxy_bias()
+        spot_ex = BinanceSpot()
         rows, fails, skipped_chg = [], 0, 0
         bar = st.progress(0.0)
         for i, s in enumerate(syms):
             bar.progress((i + 1) / len(syms), text=s)
+            is_spot = s.startswith("SPOT:")
+            exs = spot_ex if is_spot else ex
+            real = s[5:] if is_spot else s
             try:
-                dd = candles(ex, s, "1d", 60)
+                dd = candles(exs, real, "1d", 60)
                 if len(dd) < 25:
                     continue
                 # skip pegged / stable-like assets (price barely moves over 60 days)
@@ -565,7 +644,7 @@ with tab_scan:
                     continue
                 bias, why = daily_bias(dd)
                 for name in tf_choice:
-                    hd = candles(ex, s, TF_MAP[name], 300)
+                    hd = candles(exs, real, TF_MAP[name], 300)
                     if len(hd) < 60:
                         continue
                     r = analyze_tf(hd, bias, prox, swing_k)
@@ -576,7 +655,8 @@ with tab_scan:
                         continue
                     adj = 0 if dxy is None else (1 if dxy != r["side"] else -1)
                     rows.append({
-                        "Coin": ex.markets[s]["base"],
+                        "Coin": real[:-4] if is_spot else ex.markets[s]["base"],
+                        "Data": "Binance Spot" if (is_spot or exch == "binancespot") else "OKX",
                         "Daily bias": "🟢 Bullish" if bias == "bull" else "🔴 Bearish",
                         "Bias basis": why,
                         "OB type": "🟢 Bullish OB" if r["side"] == "bull" else "🔴 Bearish OB",
@@ -602,10 +682,10 @@ with tab_scan:
         bar.empty()
         st.session_state["res"] = {
             "rows": rows, "fails": fails, "n": len(syms), "exch": exch_name, "tfs": list(tf_choice),
-            "bn": bn is not None, "dxy": dxy,
+            "bn": only_bn, "dxy": dxy,
             "n_ex": n_ex, "n_bn": len(bn) if bn is not None else None, "n_match": n_match, "n_vol": n_vol,
             "min_vol": min_vol, "scan_all": scan_all, "top_n": top_n,
-            "min_chg": min_chg, "skipped_chg": skipped_chg, "n_bn_vol": n_bn_vol,
+            "min_chg": min_chg, "skipped_chg": skipped_chg, "n_bn_vol": n_bn_vol, "n_fb": n_fb,
             "time": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M"),
         }
 
@@ -620,6 +700,7 @@ with tab_scan:
             f"Coin counts: {res['exch']} USDT perpetuals = {res['n_ex']}"
             + (f" | Binance Futures list = {res['n_bn']}" if res["n_bn"] is not None else "")
             + f" | common / after Binance filter = {res['n_match']}"
+            + (f" (incl. {res['n_fb']} from the Binance Spot fallback)" if res["n_fb"] else "")
             + f" | after volume filter (min {res['min_vol']}M) = {res['n_vol']} | actually scanned = {res['n']}"
         )
         if res["n_bn"] is not None:
@@ -653,7 +734,7 @@ with tab_scan:
             if only_pd:
                 df = df[df["pd_ok"]]
             df = df[df["Score"] >= need].sort_values(["Score", "Dist %"], ascending=[False, True])
-            cols = ["Coin", "Score", "Daily bias", "Bias basis", "OB type", "OB TF", "Premium/Discount",
+            cols = ["Coin", "Data", "Score", "Daily bias", "Bias basis", "OB type", "OB TF", "Premium/Discount",
                     "PD fit", "Setup", "Confirmations", "OB zone", "Dist %", "Break (candles ago)", "Price", "Chg from open %", "Trend (ER)", "ATR %", "Zone/ATR"]
             if df.empty:
                 st.info("No coins reached the minimum score. Lower it or rescan later.")
@@ -711,7 +792,8 @@ with st.expander("📖 Terms explained (අර්ථ විස්තර)"):
 - **Scanner** column එකෙන් කියන්නේ ඒ coin එක දැන් තියෙන filter settings වලට අනුව scan එකේ ලැයිස්තුවට එනවද කියලයි. ✅ නම් එනවා. ❌ නම් ඒකට හේතුව (OB එකෙන් දුරයි, choppy, score අඩුයි, ආදිය) පෙන්නනවා. Scan එකේ coin එකක් නොපෙනුණොත් ඒකට හේතුව දැනගන්න මේක පාවිච්චි කරන්න.
 
 ### 5. Settings (පාලන)
-- **Exchange (data source)**: දත්ත ගන්න තැන. Binance Futures server එක block වෙන්න පුළුවන්. OKX Perpetual වැඩ කරනවා.
+- **Exchange (data source)**: candles (OB, bias සඳහා) ගන්න තැන. **OKX Perpetual** (පළවෙනි, default) සහ **Binance Spot** තෝරන්න පුළුවන්. Binance Futures සහ Bybit අයින් කළා.
+- **If a coin is not on OKX, check it on Binance Spot (auto)**: ටික් කරලා තියෙනවා නම්, Binance Futures එකේ තියෙන ඒත් OKX එකේ නැති coins ස්වයංක්‍රීයව Binance Spot candles වලින් scan වෙනවා (results වල **Data** column එකේ Binance Spot කියලා පෙනෙනවා). Coin Search එකේත් OKX එකේ coin එක නැත්නම් Binance Spot එකෙන් බලනවා. Spot pair එකක් නැති coins මේකෙන් scan වෙන්නේ නැහැ. Binance Spot එක විතරක් වෙනම බලන්න ඕන නම් Exchange එක ඒක තෝරන්න.
 - **Coins to scan (top by volume)**: volume වැඩිම coins කීයක් scan කරනවද කියන ගණන. Timeframes වැඩිපුර තෝරන තරමට scan එක වැඩි වෙලාවක් ගත වෙනවා.
 - **Min 24h volume (million USD)**: පසුගිය පැය 24 තුළ ඒ coin එක ඩොලර් කීයක් වටිනාකමට trade වුණාද (මිලියන වලින්). වැඩි = trade කරන අය ගොඩක්, හොඳ liquidity. අඩු = මිල ඉක්මනින් අස්ථාවර වෙනවා, fake moves වැඩියි. මේ අගය තෝරපු exchange එකේ දත්ත වලින් එන නිසා Binance volume එකට වඩා වෙනස් වෙන්න පුළුවන්.
 - **Max distance to OB zone (%)**: මිල OB කලාපයෙන් මීට වඩා දුරින් තියෙනවා නම් ඒ OB එක ගණන් ගන්නේ නැහැ.
