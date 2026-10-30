@@ -3,6 +3,7 @@ import re
 import time
 
 import ccxt
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -56,9 +57,12 @@ class BinanceSpot:
             self.fetch_tickers()
         return self.markets
 
-    def fetch_ohlcv(self, sym, tf, limit=300):
+    def fetch_ohlcv(self, sym, tf, since=None, limit=300):
         time.sleep(0.05)  # stay well under Binance's request limits
-        rows = self._get("/klines", {"symbol": sym, "interval": tf, "limit": limit})
+        params = {"symbol": sym, "interval": tf, "limit": limit}
+        if since:
+            params["startTime"] = int(since)
+        rows = self._get("/klines", params)
         return [[r[0], float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])] for r in rows]
 
 
@@ -94,6 +98,177 @@ def find_coin(exch, coin, fallback):
         except Exception:
             pass
     return None, None, None
+
+
+def tf_ms(tf):
+    """'15m' -> milliseconds per candle."""
+    return int(tf[:-1]) * {"m": 60_000, "h": 3_600_000, "d": 86_400_000}[tf[-1]]
+
+
+def fetch_history(ex, sym, tf, days):
+    """Download about `days` days of completed candles, page by page. Returns a DataFrame."""
+    step = tf_ms(tf)
+    now = int(time.time() * 1000)
+    since = now - days * 86_400_000
+    page = 1000 if isinstance(ex, BinanceSpot) else 100
+    out = []
+    for _ in range(600):  # safety cap on the number of pages
+        rows = ex.fetch_ohlcv(sym, tf, since=since, limit=page)
+        if not rows:
+            break
+        out.extend(rows)
+        nxt = rows[-1][0] + step
+        if nxt >= now or nxt <= since:
+            break
+        since = nxt
+    df = pd.DataFrame(out, columns=["ts", "open", "high", "low", "close", "vol"])
+    df = df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
+    return df[df["ts"] + step <= now].reset_index(drop=True)  # drop the unfinished candle
+
+
+def volume_profile(h, l, v, bins=100, va=0.70):
+    """Volume profile of one range of candles. Each candle's volume is spread evenly over the
+    price bins its high-low range covers. Returns POC, VAH, VAL (or None if there is no data)."""
+    lo, hi = float(np.min(l)), float(np.max(h))
+    if hi <= lo or float(np.sum(v)) <= 0:
+        return None
+    edges = np.linspace(lo, hi, bins + 1)
+    vol = np.zeros(bins)
+    for hh, ll, vv in zip(h, l, v):
+        if hh <= ll:
+            vol[min(int((hh - lo) / (hi - lo) * bins), bins - 1)] += vv
+            continue
+        inside = np.clip(edges[1:], ll, hh) - np.clip(edges[:-1], ll, hh)
+        vol += vv * inside / (hh - ll)
+    poc_i = int(vol.argmax())
+    total, got = vol.sum(), vol[poc_i]
+    lo_i = hi_i = poc_i
+    while got < va * total and (lo_i > 0 or hi_i < bins - 1):  # grow the value area around the POC
+        up = vol[hi_i + 1] if hi_i < bins - 1 else -1.0
+        dn = vol[lo_i - 1] if lo_i > 0 else -1.0
+        if up >= dn:
+            hi_i += 1
+            got += vol[hi_i]
+        else:
+            lo_i -= 1
+            got += vol[lo_i]
+    return {"POC": float((edges[poc_i] + edges[poc_i + 1]) / 2),
+            "VAH": float(edges[hi_i + 1]), "VAL": float(edges[lo_i])}
+
+
+def backtest_vp(df, tf_min, levels, stop_atr=1.0, rr=1.5, va=0.70, fee_pct=0.1, atr_n=14):
+    """Previous-day volume profile reaction backtest on completed candles.
+    Each UTC day the POC/VAH/VAL of the PREVIOUS day are used (no look-ahead). The first touch of a
+    level is traded with a limit order at the level: long if price comes down onto it, short if it
+    comes up to it. Stop = stop_atr x ATR beyond the level, target = rr x risk, time exit at day end.
+    If stop and target are inside the same candle the stop is assumed first. One trade at a time."""
+    n = len(df)
+    if n < atr_n + 3 or not levels:
+        return []
+    ts = df["ts"].values.astype("int64")
+    o, h, l, c, v = (df[k].values.astype(float) for k in ("open", "high", "low", "close", "vol"))
+    day = ts // 86_400_000
+    pc = np.r_[c[0], c[:-1]]
+    tr = np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
+    atr = np.full(n, np.nan)
+    for i in range(atr_n, n):
+        atr[i] = tr[i - atr_n:i].mean()  # only candles before i
+    per_day = 1440 / tf_min
+    days = np.unique(day)
+    trades = []
+
+    def rec(d, name, side, entry, stop, target, exit_px, outcome, risk):
+        gross = (exit_px - entry) / risk if side == "long" else (entry - exit_px) / risk
+        net = gross - (fee_pct / 100.0) * entry / risk
+        trades.append({"day": pd.Timestamp(int(d) * 86_400_000, unit="ms").strftime("%Y-%m-%d"),
+                       "level": name, "side": side, "entry": entry, "stop": stop, "target": target,
+                       "exit": exit_px, "outcome": outcome, "R": float(net),
+                       "risk_pct": float(risk / entry * 100)})
+
+    for k in range(1, len(days)):
+        prev = np.where(day == days[k - 1])[0]
+        cur = np.where(day == days[k])[0]
+        if len(cur) == 0 or len(prev) < 0.8 * per_day:
+            continue
+        prof = volume_profile(h[prev], l[prev], v[prev], va=va)
+        if prof is None:
+            continue
+        lv = {name: prof[name] for name in levels}
+        used, pos = set(), None
+        for i in cur:
+            if pos is not None:
+                if pos["side"] == "long":
+                    if l[i] <= pos["stop"]:
+                        rec(days[k], pos["name"], "long", pos["entry"], pos["stop"], pos["target"], pos["stop"], "stop", pos["risk"]); pos = None; continue
+                    if h[i] >= pos["target"]:
+                        rec(days[k], pos["name"], "long", pos["entry"], pos["stop"], pos["target"], pos["target"], "target", pos["risk"]); pos = None; continue
+                else:
+                    if h[i] >= pos["stop"]:
+                        rec(days[k], pos["name"], "short", pos["entry"], pos["stop"], pos["target"], pos["stop"], "stop", pos["risk"]); pos = None; continue
+                    if l[i] <= pos["target"]:
+                        rec(days[k], pos["name"], "short", pos["entry"], pos["stop"], pos["target"], pos["target"], "target", pos["risk"]); pos = None; continue
+            touched = []
+            for name, L in lv.items():
+                if name in used:
+                    continue
+                if o[i] > L and l[i] <= L:
+                    touched.append((abs(o[i] - L), name, L, "long"))
+                elif o[i] < L and h[i] >= L:
+                    touched.append((abs(o[i] - L), name, L, "short"))
+            if not touched:
+                continue
+            touched.sort()
+            for t in touched:
+                used.add(t[1])  # only the first touch of a level each day counts
+            if pos is not None:
+                continue
+            _, name, L, side = touched[0]
+            a = atr[i]
+            if not np.isfinite(a) or a <= 0:
+                continue
+            risk = stop_atr * a
+            stop = L - risk if side == "long" else L + risk
+            target = L + rr * risk if side == "long" else L - rr * risk
+            if (side == "long" and l[i] <= stop) or (side == "short" and h[i] >= stop):
+                rec(days[k], name, side, L, stop, target, stop, "stop", risk)  # stopped in the entry candle
+                continue
+            pos = {"name": name, "side": side, "entry": L, "stop": stop, "target": target, "risk": risk}
+        if pos is not None:  # time exit at the end of the day
+            rec(days[k], pos["name"], pos["side"], pos["entry"], pos["stop"], pos["target"],
+                float(c[cur[-1]]), "time", pos["risk"])
+    return trades
+
+
+def summarize(trades):
+    """Headline numbers of a list of trades."""
+    if not trades:
+        return {"trades": 0, "win": 0.0, "avg_r": 0.0, "total_r": 0.0, "pf": 0.0, "max_dd": 0.0,
+                "h1": float("nan"), "h2": float("nan"), "risk_pct": 0.0}
+    R = np.array([t["R"] for t in trades])
+    wins, losses = R[R > 0].sum(), -R[R < 0].sum()
+    pf = wins / losses if losses > 0 else (99.0 if wins > 0 else 0.0)
+    cum = np.cumsum(R)
+    half = len(R) // 2
+    return {"trades": int(len(R)), "win": float((R > 0).mean() * 100), "avg_r": float(R.mean()),
+            "total_r": float(R.sum()), "pf": float(min(pf, 99.0)),
+            "max_dd": float((np.maximum.accumulate(cum) - cum).max()),
+            "h1": float(R[:half].mean()) if half > 0 else float("nan"),
+            "h2": float(R[half:].mean()),
+            "risk_pct": float(np.mean([t["risk_pct"] for t in trades]))}
+
+
+@st.cache_resource(ttl=3600, show_spinner=False)
+def get_ex(exch):
+    """One shared exchange object with its markets loaded (used for the long history downloads)."""
+    ex = make_ex(exch)
+    ex.load_markets()
+    return ex
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def history_df(exch, sym, tf, days):
+    """Completed candles for roughly `days` days (cached for an hour, so changing stop / R settings is instant)."""
+    return fetch_history(get_ex(exch), sym, tf, days)
 
 
 def swings(d, k=2):
@@ -620,7 +795,7 @@ def run_scan():
 
 
 prog_box = st.container()  # scan progress and messages show here, above the tabs
-tab_scan, tab_entry, tab_search = st.tabs(["📊 Coin Scan", "🎯 Entry Ready", "🔎 Coin Search"])
+tab_scan, tab_entry, tab_search, tab_vp = st.tabs(["📊 Coin Scan", "🎯 Entry Ready", "🔎 Coin Search", "🧪 VP Backtest"])
 
 with tab_search:
     st.caption("Type a coin name to see its details. It uses the same settings as the scanner above.")
@@ -803,6 +978,186 @@ with tab_entry:
                 st.caption("Invalidation = the far edge of the OB zone. A candle closing beyond it cancels that OB. "
                            "Candidates only, not trade advice: confirm on the chart first.")
 
+with tab_vp:
+    st.subheader("Volume profile reaction backtest")
+    st.caption("Separate from the other pages. Every day the app builds a volume profile of the PREVIOUS UTC day and "
+               "tests what happens when price first touches that profile's POC, VAH or VAL: a limit order at the level, "
+               "stop beyond it, fixed R target, exit at the end of the day. Uses the data source chosen at the top.")
+    p1, p2, p3, p4 = st.columns(4)
+    vp_months = p1.slider("Backtest length (months)", 1, 12, 3)
+    vp_tf = p2.selectbox("Candle size", ["15m", "30m", "1h", "5m"], index=0)
+    vp_levels = p3.multiselect("Levels to trade", ["POC", "VAH", "VAL"], default=["POC", "VAH", "VAL"])
+    vp_va = p4.slider("Value area (%)", 60, 80, 70)
+    p5, p6, p7 = st.columns(3)
+    vp_stop = p5.slider("Stop distance (x ATR beyond the level)", 0.25, 3.0, 1.0, 0.25)
+    vp_rr = p6.slider("Target (R multiple)", 0.5, 4.0, 1.5, 0.25)
+    vp_fee = p7.slider("Round-trip fees + slippage (%)", 0.0, 0.3, 0.1, 0.01)
+
+
+def vp_params():
+    return (f"{vp_months} months of {vp_tf} | levels {', '.join(vp_levels)} | value area {vp_va}% | "
+            f"stop {vp_stop}x ATR | target {vp_rr}R | fees {vp_fee}%")
+
+
+def vp_eval(df, name, src):
+    """Backtest one coin's candles with the current settings."""
+    trades = backtest_vp(df, tf_ms(vp_tf) // 60_000, vp_levels, vp_stop, vp_rr, vp_va / 100.0, vp_fee)
+    days = int(len(np.unique(df["ts"].values // 86_400_000))) if len(df) else 0
+    return {"coin": name, "src": src, "days": days, "trades": trades, "sum": summarize(trades),
+            "params": vp_params()}
+
+
+def vp_run_coin(coin):
+    """Download history for one coin (OKX first, Binance Spot as a fallback) and backtest it."""
+    ex1, sym1, src1 = find_coin(exch, coin, fallback)
+    if sym1 is None:
+        return None
+    df = history_df(src1, sym1, vp_tf, vp_months * 30 + 1)
+    return vp_eval(df, coin, src1)
+
+
+def vp_row(r):
+    z = r["sum"]
+    return {"Coin": r["coin"], "Data": "Binance Spot" if r["src"] == "binancespot" else "OKX",
+            "Days": r["days"], "Trades": z["trades"], "Win %": round(z["win"], 1),
+            "Avg R": round(z["avg_r"], 2), "Profit factor": round(z["pf"], 2),
+            "Total R": round(z["total_r"], 1), "Max drawdown (R)": round(z["max_dd"], 1),
+            "1st half avg R": round(z["h1"], 2) if z["h1"] == z["h1"] else None,
+            "2nd half avg R": round(z["h2"], 2), "Avg stop %": round(z["risk_pct"], 2)}
+
+
+with tab_vp:
+    st.markdown("#### 1. Backtest one coin")
+    b1, b2 = st.columns([3, 1])
+    vp_coin = b1.text_input("Coin name (e.g. PUMP, SOL)", "PUMP", key="vp_coin").strip().upper()
+    b2.write("")
+    if b2.button("Run backtest", key="vp_run_one") and vp_coin:
+        if not vp_levels:
+            st.warning("Pick at least one level to trade.")
+        else:
+            with st.spinner(f"Downloading {vp_months} months of {vp_tf} candles for {vp_coin} ..."):
+                try:
+                    out1 = vp_run_coin(vp_coin)
+                    if out1 is None:
+                        st.warning(f"{vp_coin} was not found on {exch_name}"
+                                   + (" or on Binance Spot." if fallback and exch == "okx" else "."))
+                    else:
+                        st.session_state["vp_one"] = out1
+                except Exception as e:
+                    st.error(f"Could not backtest {vp_coin}: {e}")
+    r1 = st.session_state.get("vp_one")
+    if r1:
+        z = r1["sum"]
+        st.caption(f"{r1['coin']} | data: {'Binance Spot' if r1['src'] == 'binancespot' else 'OKX'} | "
+                   f"{r1['days']} days of candles | {r1['params']}")
+        if r1["days"] < vp_months * 30 * 0.8:
+            st.warning(f"Only {r1['days']} days of candles were found (new coin or limited history), "
+                       "so the period is shorter than you asked for.")
+        if z["trades"] < 20:
+            st.warning(f"Only {z['trades']} trades: too few to trust. Use a longer period or more levels.")
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Trades", z["trades"])
+        m2.metric("Win rate", f"{z['win']:.1f}%")
+        m3.metric("Avg R / trade", f"{z['avg_r']:+.2f}")
+        m4.metric("Profit factor", f"{z['pf']:.2f}")
+        m5.metric("Total R", f"{z['total_r']:+.1f}")
+        h1txt = "n/a" if z["h1"] != z["h1"] else f"{z['h1']:+.2f}"
+        st.caption(f"Max drawdown {z['max_dd']:.1f} R | average R: first half {h1txt}, second half {z['h2']:+.2f} | "
+                   f"average stop distance {z['risk_pct']:.2f}% of price. (1R = the distance from entry to stop.)")
+        if r1["trades"]:
+            tdf = pd.DataFrame(r1["trades"])
+            lv = tdf.groupby("level").agg(Trades=("R", "size"), AvgR=("R", "mean"), TotalR=("R", "sum"),
+                                          Win=("R", lambda x: (x > 0).mean() * 100)).reset_index()
+            lv = lv.rename(columns={"level": "Level", "AvgR": "Avg R", "TotalR": "Total R", "Win": "Win %"}).round(2)
+            st.dataframe(lv, hide_index=True)
+            st.line_chart(pd.DataFrame({"Cumulative R": tdf["R"].cumsum().values}))
+            with st.expander("All trades"):
+                st.dataframe(tdf[["day", "level", "side", "entry", "stop", "target", "exit", "outcome", "R"]],
+                             hide_index=True)
+
+    st.markdown("#### 2. Find coins like this")
+    st.caption("Backtests many coins with the settings above and keeps the ones that pass your quality limits. "
+               "Each coin downloads thousands of candles, so a long period with many coins takes minutes.")
+    q1, q2, q3 = st.columns(3)
+    sc_n = q1.slider("Coins to test (top by 24h volume)", 10, 150, 30, 10)
+    sc_vol = q1.slider("Min 24h volume (million USD)", 0, 500, 0, key="vp_sc_vol")
+    sc_trades = q2.slider("Min trades", 5, 100, 20)
+    sc_avg = q2.slider("Min average R per trade", -0.5, 1.0, 0.1, 0.05)
+    sc_pf = q3.slider("Min profit factor", 0.0, 3.0, 1.2, 0.1)
+    sc_both = q3.checkbox("Both halves of the period must be profitable", True)
+    sc_bench = st.text_input("Benchmark coin (shown on top for comparison, empty = none)", "PUMP",
+                             key="vp_bench").strip().upper()
+    if st.button("Scan coins", key="vp_scan_btn"):
+        if not vp_levels:
+            st.warning("Pick at least one level to trade.")
+        else:
+            try:
+                exu = get_ex(exch)
+                tick = exu.fetch_tickers()
+            except Exception as e:
+                tick = None
+                st.error(f"Could not get the coin list from {exch_name}: {e}")
+            if tick is not None:
+                pairs = []
+                for s_, m_ in exu.markets.items():
+                    if (m_.get("swap") and m_.get("linear") and m_.get("quote") == "USDT"
+                            and m_.get("settle") == "USDT" and m_.get("active") is not False
+                            and m_.get("base") not in STABLES and s_ in tick):
+                        t_ = tick[s_]
+                        vol_ = t_.get("quoteVolume")
+                        if not vol_ and t_.get("baseVolume") and t_.get("last"):
+                            vol_ = t_["baseVolume"] * t_["last"]
+                        pairs.append((float(vol_ or 0), s_))
+                if any(v_ > 0 for v_, _ in pairs):
+                    pairs = [p_ for p_ in pairs if p_[0] >= sc_vol * 1_000_000]
+                syms = [s_ for _, s_ in sorted(pairs, reverse=True)[:sc_n]]
+                if not syms:
+                    st.error("No coins matched. Lower the minimum volume.")
+                else:
+                    bar = st.progress(0.0)
+                    res_rows, fails = [], 0
+                    for i, s_ in enumerate(syms):
+                        bar.progress((i + 1) / len(syms), text=s_)
+                        try:
+                            dfh = history_df(exch, s_, vp_tf, vp_months * 30 + 1)
+                            res_rows.append(vp_eval(dfh, exu.markets[s_]["base"], exch))
+                        except Exception:
+                            fails += 1
+                    bar.empty()
+                    bench = None
+                    if sc_bench:
+                        try:
+                            bench = vp_run_coin(sc_bench)
+                        except Exception:
+                            bench = None
+                    st.session_state["vp_scan"] = {
+                        "rows": res_rows, "bench": bench, "fails": fails, "n": len(syms),
+                        "params": vp_params(), "exch": exch_name,
+                        "time": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M")}
+
+    rs = st.session_state.get("vp_scan")
+    if rs:
+        def vp_pass(z):
+            ok = z["trades"] >= sc_trades and z["avg_r"] >= sc_avg and z["pf"] >= sc_pf
+            if sc_both:
+                ok = ok and z["h1"] == z["h1"] and z["h1"] > 0 and z["h2"] > 0
+            return ok
+
+        st.caption(f"Tested {rs['n']} coins on {rs['exch']} at {rs['time']} UTC | {rs['params']} | failed: {rs['fails']}")
+        if rs["bench"]:
+            st.markdown("**Benchmark**")
+            st.dataframe(pd.DataFrame([vp_row(rs["bench"])]), hide_index=True)
+        good = [vp_row(r) for r in rs["rows"] if vp_pass(r["sum"])]
+        if not good:
+            st.info("No coin passed your quality limits. Lower the limits above, or test more coins.")
+        else:
+            gdf = pd.DataFrame(good).sort_values(["Avg R", "Trades"], ascending=[False, False])
+            st.markdown(f"**{len(gdf)} coins passed**")
+            st.dataframe(gdf, hide_index=True)
+        st.caption("Picking the best coins out of many from the same period flatters the numbers: some of them are just "
+                   "lucky. Treat this list as candidates, then check each one with Backtest one coin on a longer "
+                   "period or a different candle size. Backtests are not a promise of future results.")
+
 with st.expander("📖 Terms explained (අර්ථ විස්තර)"):
     st.markdown(
         """
@@ -859,6 +1214,16 @@ with st.expander("📖 Terms explained (අර්ථ විස්තර)"):
 - **Direction**: Bullish OB = 🟢 LONG, Bearish OB = 🔴 SHORT. **Invalidation**: OB zone එකේ අනිත් කෙළවර (LONG නම් zone එකේ පහළ, SHORT නම් ඉහළ). candle එකක් ඒක ඉක්මවා close වුණොත් ඒ OB එක අවලංගුයි.
 - ලැයිස්තුව හිස් නම්, දැන් එහෙම coin එකක් නැහැ කියන එකයි. නැවත පස්සේ scan කරන්න, නැත්නම් rules ටික් අයින් කරන්න.
 - මේ candidates ලැයිස්තුවක් විතරයි, trade advice නෙවෙයි. chart එකේ තහවුරු කරගන්න.
+
+### 4f. VP Backtest page (Volume profile backtest)
+- **අදහස**: කලින් දවසේ (ඊයේ, UTC) fixed-range volume profile එකේ **POC** (වැඩිම volume ගිය මිල), **VAH** / **VAL** (volume වලින් 70%ක් ගිය පරාසයේ ඉහළ / පහළ කෙළවර) වලට අද දවසේ මිල react කරනවද කියලා, දවස් ගාණක් පුරා backtest කරනවා. Coin එකේ මිල ඒ මට්ටම් වලට ගොඩක් වෙලාවට respond කරනවා නම්, ඒ වගේ coin එකක trade කිරීම ලේසියි කියන ඔයාගේ අදහසට ගැළපෙනවා.
+- **Trade නීතිය**: හැම දවසකම ඊයේ දවසේ profile එකෙන් POC/VAH/VAL ගන්නවා (අදට කලින් දත්ත විතරයි, අනාගතය බලන්නේ නැහැ). මිල ඉහළින් ඇවිත් මට්ටමට පහළට ගැටුණොත් **LONG**, පහළින් ඇවිත් ඉහළට ගැටුණොත් **SHORT**, මට්ටමේම limit order එකක්. **Stop** = මට්ටමෙන් ඔබ්බට ATR ගුණයක් (default 1×), **Target** = risk එකේ R ගුණයක් (default 1.5R), තවම open නම් දවස අවසානයේ close එකෙන් ඉවත් වෙනවා. මට්ටමක් දවසකට පළවෙනි වතාවට ගැටෙන වෙලාවේ විතරයි trade කරන්නේ, එක වරකට එක trade.
+- **R**: 1R = entry එකේ සිට stop එක දක්වා දුර. ජයග්‍රහණයක් +1.5R, පරාජයක් −1R. **Avg R** = trade එකකින් සාමාන්‍යයෙන් R කීයක්ද (fees අඩුකරලා). **Profit factor** = මුළු ලාභය ÷ මුළු පාඩුව (1ට වැඩි = ලාභයි). **Max drawdown** = එකතුවේ ඉහළම ලක්ෂ්‍යයෙන් වැටුණු උපරිම R ප්‍රමාණය.
+- **1st half / 2nd half avg R**: trades අඩකට බෙදලා දෙපැත්තේම ලාභයද බලනවා. දෙකම ධනාත්මක නම් එක වාසනාවන්ත කාලයකින් එන ප්‍රතිඵලයක් නෙවෙයි වෙන්න වැඩි ඉඩක්.
+- **1. Backtest one coin**: coin නමක් (උදා: PUMP) type කරලා මාස ගාණක් (1-12) තෝරලා run කරන්න. OKX එකේ නැත්නම් Binance Spot එකෙන් ගන්නවා. Trades 20ට අඩු නම් ප්‍රතිඵලය විශ්වාස කරන්න බැහැ කියලා අවවාද කරනවා.
+- **2. Find coins like this**: volume වැඩිම coins N ගාණක් එකම settings වලින් backtest කරලා, ඔයා දාපු ගුණාත්මක සීමා (min trades, min avg R, min profit factor, දෙපැත්තම ලාභයි) පසුකරන coins ලැයිස්තුවක් දෙනවා. **Benchmark** (default PUMP) උඩින් පෙන්නන නිසා ඒ coin එකත් එක්ක සංසන්දනය කරන්න පුළුවන්. Scan කරලා ඉවරවුණාම සීමා slider වෙනස් කළොත් ආයෙත් scan කරන්න ඕන නැහැ.
+- **Download**: coin එකකට candles දහස් ගණනක් බාගන්නවා, ඒ නිසා මාස 3ක් coins ගොඩක් scan කරද්දී විනාඩි ගණනක් යනවා. බාගත් දත්ත පැයක් cache වෙනවා, ඒ නිසා stop / R / fees වෙනස් කරලා ආයෙත් run කරන එක ඉක්මනයි.
+- **අවවාදය**: coins ගොඩකින් හොඳම ඒවා තෝරද්දී සමහර ඒවා හුදෙක් වාසනාවට හොඳ පෙනෙන්න පුළුවන්. මේ ලැයිස්තුව candidates විතරයි, ඒවා වෙනම backtest කරලා (වැඩි කාලයක් / වෙනස් candle size එකකින්) තහවුරු කරන්න. අතීත ප්‍රතිඵල අනාගතය සහතික කරන්නේ නැහැ.
 
 ### 5. Settings (පාලන)
 - **Exchange (data source)**: candles (OB, bias සඳහා) ගන්න තැන. **OKX Perpetual** (පළවෙනි, default) සහ **Binance Spot** තෝරන්න පුළුවන්. Binance Futures සහ Bybit අයින් කළා.
