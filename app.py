@@ -983,15 +983,33 @@ with tab_vp:
     st.caption("Separate from the other pages. Every day the app builds a volume profile of the PREVIOUS UTC day and "
                "tests what happens when price first touches that profile's POC, VAH or VAL: a limit order at the level, "
                "stop beyond it, fixed R target, exit at the end of the day. Uses the data source chosen at the top.")
+    with st.expander("🙋 ප්‍රතිඵල තේරුම් ගන්නේ කොහොමද? (සරලව)", expanded=True):
+        st.markdown(
+            r"""
+**උදාහරණයක්**: ඔයා trade එකකට **10 USD** risk කරනවා කියලා හිතන්න. එතකොට:
+- **R** කියන්නේ ඔයා එක trade එකකදී පාඩුවට ලක්වෙන්න ඉඩ තියෙන මුදල. **1R = 10 USD**. Stop එක වැදුණොත් **−1R** (−10 USD). Target එක (1.5R) ජයගත්තොත් **+1.5R** (+15 USD).
+- **Trades**: මේ strategy එකේ නීතියට අනුව කාලය තුළ ගත්ත trades ගණන. **20ට අඩු නම් ප්‍රතිඵලය විශ්වාස කරන්න බැහැ** (වාසනාව වෙන්න පුළුවන්).
+- **Win rate**: trades වලින් කීයක් ජයගත්තද (%). 1.5R target එකට 40%කට වඩා win rate එකක් තිබුණොත් break-even ඉක්මවනවා.
+- **Avg R (වැදගත්ම අංකය)**: trade එකකින් සාමාන්‍යයෙන් ලැබෙන R. **+0.20** = trade එකකට සාමාන්‍යයෙන් +2 USD ලාභයක් (10 USD risk). **ඍණ නම්** ඒ coin එකේ මේ strategy එක දිගටම පාඩුවක්.
+- **Total R**: හැම trade එකකම R එකතුව. **+30R** = 10 USD risk නම් මුළු ලාභය 300 USD.
+- **Profit factor**: මුළු ලාභය ÷ මුළු පාඩුව. **1.0** = break-even (ලාභයත් පාඩුවත් සමාන). **1.5** = පාඩුවක් 1 USDට ලාභය 1.5 USD. **1ට අඩු** = පාඩුවක්.
+- **Max drawdown**: ලාභය උපරිමයට ගිහින් පස්සේ පහළට වැටුණු විශාලම ප්‍රමාණය (R වලින්). **10R** = 10 USD risk නම් එක දිගට 100 USD වැටුණා. **අඩු = ආරක්ෂිතයි**, ඔයාට දරාගන්න පුළුවන්ද කියලා බලන්න.
+- **1st half / 2nd half avg R**: කාලය අඩකට බෙදලා දෙපැත්තේම ලාභද බලනවා. එක පැත්තක් විතරක් ලාභ නම් ඒක වාසනාවන්ත කාලයක් වෙන්න පුළුවන්. **දෙකම ධනාත්මක නම් හොඳයි.**
+- **Avg stop %**: stop එකට මිලෙන් ඇති දුර (%). ගොඩක් පොඩි නම් fees වලින් ලාභය කෑවෙනවා.
+
+**හොඳ coin එකක සලකුණු**: Avg R **0.1ට වැඩි**, Profit factor **1.2ට වැඩි**, trades **30ට වැඩි**, 1st සහ 2nd half **දෙකම ධනාත්මක**, Max drawdown **පොඩියි**.
+"""
+        )
     p1, p2, p3, p4 = st.columns(4)
     vp_months = p1.slider("Backtest length (months)", 1, 12, 3)
     vp_tf = p2.selectbox("Candle size", ["15m", "30m", "1h", "5m"], index=0)
     vp_levels = p3.multiselect("Levels to trade", ["POC", "VAH", "VAL"], default=["POC", "VAH", "VAL"])
     vp_va = p4.slider("Value area (%)", 60, 80, 70)
-    p5, p6, p7 = st.columns(3)
+    p5, p6, p7, p8 = st.columns(4)
     vp_stop = p5.slider("Stop distance (x ATR beyond the level)", 0.25, 3.0, 1.0, 0.25)
     vp_rr = p6.slider("Target (R multiple)", 0.5, 4.0, 1.5, 0.25)
     vp_fee = p7.slider("Round-trip fees + slippage (%)", 0.0, 0.3, 0.1, 0.01)
+    vp_usd = p8.slider("Example: risk per trade (USD)", 1, 1000, 10)
 
 
 def vp_params():
@@ -1014,6 +1032,109 @@ def vp_run_coin(coin):
         return None
     df = history_df(src1, sym1, vp_tf, vp_months * 30 + 1)
     return vp_eval(df, coin, src1)
+
+
+def vp_plain(z):
+    """One plain-language (Sinhala) sentence about a result."""
+    if z["trades"] == 0:
+        return "මේ කාලය තුළ මේ නීතියට trade එකක්වත් ලැබුණේ නැහැ."
+    verdict = "මේ coin එකේ මේ strategy එක ලාභයි." if z["avg_r"] > 0 else "මේ coin එකේ මේ strategy එක පාඩුයි."
+    return (f"සරලව: trades {z['trades']}ක් අතරින් {z['win']:.0f}%ක් ජයගත්තා. trade එකකට {vp_usd} USD risk කළා නම් "
+            f"මුළු ප්‍රතිඵලය ≈ {z['total_r'] * vp_usd:+,.0f} USD (trade එකකට සාමාන්‍යයෙන් {z['avg_r'] * vp_usd:+.1f} USD). "
+            f"{verdict}")
+
+
+def vp_compare_table(ra, rb, na, nb):
+    """Every backtest number of two coins side by side, with a 'Better' column."""
+    za, zb = ra["sum"], rb["sum"]
+
+    def recovery(z):
+        return z["total_r"] / z["max_dd"] if z["max_dd"] > 0 else (99.0 if z["total_r"] > 0 else 0.0)
+
+    items = [  # label, value A, value B, format, higher is better (None = no verdict)
+        ("Days of candles tested", ra["days"], rb["days"], "{:.0f}", None),
+        ("Trades", za["trades"], zb["trades"], "{:.0f}", None),
+        ("Win rate (%)", za["win"], zb["win"], "{:.1f}", True),
+        ("Average R per trade", za["avg_r"], zb["avg_r"], "{:+.2f}", True),
+        ("Profit factor", za["pf"], zb["pf"], "{:.2f}", True),
+        ("Total R", za["total_r"], zb["total_r"], "{:+.1f}", True),
+        (f"Total result with {vp_usd} USD risk per trade", za["total_r"] * vp_usd, zb["total_r"] * vp_usd,
+         "{:+,.0f} USD", True),
+        ("Max drawdown (R)", za["max_dd"], zb["max_dd"], "{:.1f}", False),
+        ("Total R / max drawdown", recovery(za), recovery(zb), "{:.2f}", True),
+        ("1st half average R", za["h1"], zb["h1"], "{:+.2f}", True),
+        ("2nd half average R", za["h2"], zb["h2"], "{:+.2f}", True),
+        ("Average stop distance (%)", za["risk_pct"], zb["risk_pct"], "{:.2f}", None),
+    ]
+    rows = [{"Metric": "Data source",
+             na: "Binance Spot" if ra["src"] == "binancespot" else "OKX",
+             nb: "Binance Spot" if rb["src"] == "binancespot" else "OKX", "Better": "-"}]
+    for label, a, b, f, hi in items:
+        fa = "n/a" if a != a else f.format(a)
+        fb = "n/a" if b != b else f.format(b)
+        if hi is None or a != a or b != b or abs(a - b) < 1e-9:
+            better = "-"
+        else:
+            better = na if (a > b) == hi else nb
+        rows.append({"Metric": label, na: fa, nb: fb, "Better": better})
+    return pd.DataFrame(rows)
+
+
+def vp_verdict(ra, rb, na, nb):
+    """Plain-language (Sinhala) comparison. Returns (list of lines, kind) where kind is ok / warn."""
+    za, zb = ra["sum"], rb["sum"]
+    pts = {na: 0, nb: 0}
+
+    def judge(a, b, higher=True, tol=0.0):
+        if a != a or b != b or abs(a - b) <= tol:
+            return
+        pts[na if (a > b) == higher else nb] += 1
+
+    judge(za["avg_r"], zb["avg_r"], True, 0.02)
+    judge(za["pf"], zb["pf"], True, 0.05)
+    judge(za["total_r"], zb["total_r"], True, 0.5)
+    judge(za["max_dd"], zb["max_dd"], False, 0.5)
+    ca = float(za["h1"] == za["h1"] and za["h1"] > 0 and za["h2"] > 0)
+    cb = float(zb["h1"] == zb["h1"] and zb["h1"] > 0 and zb["h2"] > 0)
+    judge(ca, cb, True, 0.0)
+    lines, kind = [], "ok"
+    if za["trades"] < 20 or zb["trades"] < 20:
+        lines.append(f"⚠️ trades ගණන අඩුයි ({na}: {za['trades']}, {nb}: {zb['trades']}). 20ට අඩු නම් ප්‍රතිඵලය විශ්වාස කරන්න බැහැ, "
+                     "වැඩි මාස ගාණක් හෝ තවත් levels තෝරලා ආයෙත් බලන්න.")
+        kind = "warn"
+    if max(za["avg_r"], zb["avg_r"]) <= 0:
+        lines.append("දෙකේම Avg R ඍණයි, ඒ කියන්නේ මේ strategy එක (මේ settings වලින්) මේ coins දෙකටම ලාභදායි නැහැ.")
+        kind = "warn"
+    elif pts[na] == pts[nb]:
+        lines.append(f"ලකුණු සමානයි ({pts[na]} - {pts[nb]}). {na} සහ {nb} අතර පැහැදිලි වෙනසක් නැහැ.")
+    else:
+        w, l = (na, nb) if pts[na] > pts[nb] else (nb, na)
+        lines.append(f"ඔයාගේ strategy එකට (මේ settings වලින්) **{w}** වඩා හොඳයි: ලකුණු {pts[w]} - {pts[l]} "
+                     "(Avg R, Profit factor, Total R, Max drawdown, දෙපැත්තම ලාභයි කියන 5 අතරින්).")
+    lines.append("මතක තියාගන්න: මේ අතීත ප්‍රතිඵල විතරයි, අනාගතය සහතික කරන්නේ නැහැ.")
+    return lines, kind
+
+
+def vp_curve(r, nm):
+    """Cumulative R by calendar day."""
+    if not r["trades"]:
+        return pd.Series(dtype=float, name=nm)
+    t = pd.DataFrame(r["trades"])
+    cs = t.groupby("day")["R"].sum().cumsum()
+    cs.index = pd.to_datetime(cs.index)
+    cs.name = nm
+    return cs
+
+
+def vp_level_compare(ra, rb, na, nb):
+    def one(r, nm):
+        if not r["trades"]:
+            return pd.DataFrame({"Level": [], f"{nm} trades": [], f"{nm} avg R": []})
+        g = pd.DataFrame(r["trades"]).groupby("level")["R"].agg(["size", "mean"]).reset_index()
+        g.columns = ["Level", f"{nm} trades", f"{nm} avg R"]
+        g[f"{nm} avg R"] = g[f"{nm} avg R"].round(2)
+        return g
+    return one(ra, na).merge(one(rb, nb), on="Level", how="outer")
 
 
 def vp_row(r):
@@ -1056,14 +1177,16 @@ with tab_vp:
         if z["trades"] < 20:
             st.warning(f"Only {z['trades']} trades: too few to trust. Use a longer period or more levels.")
         m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Trades", z["trades"])
-        m2.metric("Win rate", f"{z['win']:.1f}%")
-        m3.metric("Avg R / trade", f"{z['avg_r']:+.2f}")
-        m4.metric("Profit factor", f"{z['pf']:.2f}")
-        m5.metric("Total R", f"{z['total_r']:+.1f}")
+        m1.metric("Trades", z["trades"], help="කාලය තුළ ගත්ත trades ගණන. 20ට අඩු නම් විශ්වාස කරන්න බැහැ.")
+        m2.metric("Win rate", f"{z['win']:.1f}%", help="trades වලින් කීයක් ජයගත්තද.")
+        m3.metric("Avg R / trade", f"{z['avg_r']:+.2f}",
+                  help="trade එකකින් සාමාන්‍යයෙන් ලැබෙන R (1R = stop එකට ඇති දුර). ධනාත්මක නම් ලාභයි.")
+        m4.metric("Profit factor", f"{z['pf']:.2f}", help="මුළු ලාභය ÷ මුළු පාඩුව. 1ට වැඩි නම් ලාභයි.")
+        m5.metric("Total R", f"{z['total_r']:+.1f}", help="හැම trade එකකම R එකතුව.")
         h1txt = "n/a" if z["h1"] != z["h1"] else f"{z['h1']:+.2f}"
         st.caption(f"Max drawdown {z['max_dd']:.1f} R | average R: first half {h1txt}, second half {z['h2']:+.2f} | "
                    f"average stop distance {z['risk_pct']:.2f}% of price. (1R = the distance from entry to stop.)")
+        st.info(vp_plain(z))
         if r1["trades"]:
             tdf = pd.DataFrame(r1["trades"])
             lv = tdf.groupby("level").agg(Trades=("R", "size"), AvgR=("R", "mean"), TotalR=("R", "sum"),
@@ -1075,7 +1198,7 @@ with tab_vp:
                 st.dataframe(tdf[["day", "level", "side", "entry", "stop", "target", "exit", "outcome", "R"]],
                              hide_index=True)
 
-    st.markdown("#### 2. Find coins like this")
+    st.markdown("#### 2. Find coins like this (scan many coins)")
     st.caption("Backtests many coins with the settings above and keeps the ones that pass your quality limits. "
                "Each coin downloads thousands of candles, so a long period with many coins takes minutes.")
     q1, q2, q3 = st.columns(3)
@@ -1158,6 +1281,52 @@ with tab_vp:
                    "lucky. Treat this list as candidates, then check each one with Backtest one coin on a longer "
                    "period or a different candle size. Backtests are not a promise of future results.")
 
+    st.markdown("#### 3. Compare two coins")
+    st.caption("Runs the same backtest on two coins with the settings above and puts every number side by side, "
+               "so you can see which one suits this strategy better.")
+    k1, k2, k3 = st.columns([2, 2, 1])
+    cmp_a = k1.text_input("Coin A", "PUMP", key="vp_cmp_a").strip().upper()
+    cmp_b = k2.text_input("Coin B", "WIF", key="vp_cmp_b").strip().upper()
+    k3.write("")
+    if k3.button("Compare", key="vp_cmp_btn") and cmp_a and cmp_b:
+        if not vp_levels:
+            st.warning("Pick at least one level to trade.")
+        elif cmp_a == cmp_b:
+            st.warning("Type two different coins to compare.")
+        else:
+            outs = {}
+            with st.spinner("Downloading candles and backtesting both coins ..."):
+                for nm in (cmp_a, cmp_b):
+                    try:
+                        outs[nm] = vp_run_coin(nm)
+                    except Exception as e:
+                        outs[nm] = None
+                        st.error(f"Could not backtest {nm}: {e}")
+            st.session_state["vp_cmp"] = {"a": outs.get(cmp_a), "b": outs.get(cmp_b), "na": cmp_a, "nb": cmp_b}
+
+    rc = st.session_state.get("vp_cmp")
+    if rc:
+        ra, rb = rc["a"], rc["b"]
+        if ra is None or rb is None:
+            miss = [n_ for n_, r_ in ((rc["na"], ra), (rc["nb"], rb)) if r_ is None]
+            st.warning(f"Not found on {exch_name}" + (" or Binance Spot" if fallback and exch == "okx" else "")
+                       + f", or could not be tested: {', '.join(miss)}")
+        else:
+            na, nb = ra["coin"], rb["coin"]
+            st.caption(ra["params"])
+            vlines, vkind = vp_verdict(ra, rb, na, nb)
+            (st.warning if vkind == "warn" else st.success)("\n\n".join(vlines))
+            st.dataframe(vp_compare_table(ra, rb, na, nb), hide_index=True)
+            st.markdown("**By level (POC / VAH / VAL)**")
+            st.dataframe(vp_level_compare(ra, rb, na, nb), hide_index=True)
+            curves = pd.concat([vp_curve(ra, na), vp_curve(rb, nb)], axis=1, sort=True).ffill().fillna(0)
+            if not curves.empty:
+                st.markdown("**Cumulative R over time**")
+                st.line_chart(curves)
+            for r_, n_ in ((ra, na), (rb, nb)):
+                if r_["days"] < vp_months * 30 * 0.8:
+                    st.warning(f"{n_}: only {r_['days']} days of candles were found (new coin or limited history).")
+
 with st.expander("📖 Terms explained (අර්ථ විස්තර)"):
     st.markdown(
         """
@@ -1222,6 +1391,7 @@ with st.expander("📖 Terms explained (අර්ථ විස්තර)"):
 - **1st half / 2nd half avg R**: trades අඩකට බෙදලා දෙපැත්තේම ලාභයද බලනවා. දෙකම ධනාත්මක නම් එක වාසනාවන්ත කාලයකින් එන ප්‍රතිඵලයක් නෙවෙයි වෙන්න වැඩි ඉඩක්.
 - **1. Backtest one coin**: coin නමක් (උදා: PUMP) type කරලා මාස ගාණක් (1-12) තෝරලා run කරන්න. OKX එකේ නැත්නම් Binance Spot එකෙන් ගන්නවා. Trades 20ට අඩු නම් ප්‍රතිඵලය විශ්වාස කරන්න බැහැ කියලා අවවාද කරනවා.
 - **2. Find coins like this**: volume වැඩිම coins N ගාණක් එකම settings වලින් backtest කරලා, ඔයා දාපු ගුණාත්මක සීමා (min trades, min avg R, min profit factor, දෙපැත්තම ලාභයි) පසුකරන coins ලැයිස්තුවක් දෙනවා. **Benchmark** (default PUMP) උඩින් පෙන්නන නිසා ඒ coin එකත් එක්ක සංසන්දනය කරන්න පුළුවන්. Scan කරලා ඉවරවුණාම සීමා slider වෙනස් කළොත් ආයෙත් scan කරන්න ඕන නැහැ.
+- **3. Compare two coins**: coin දෙකක් (උදා: PUMP සහ WIF) එකම settings වලින් backtest කරලා, සියලු අංක එක table එකක අල්ලපු කොටු වශයෙන් පෙන්නනවා (**Better** column එකෙන් එක එක අංකයට හොඳ coin එක), POC/VAH/VAL වෙන වෙනම ප්‍රතිඵල, කාලය අනුව cumulative R chart එක, සහ සරල සිංහල නිගමනයක් (ලකුණු 5ක් අනුව ඔයාගේ strategy එකට හොඳ coin එක). trades 20ට අඩු නම් අවවාද කරනවා.
 - **Download**: coin එකකට candles දහස් ගණනක් බාගන්නවා, ඒ නිසා මාස 3ක් coins ගොඩක් scan කරද්දී විනාඩි ගණනක් යනවා. බාගත් දත්ත පැයක් cache වෙනවා, ඒ නිසා stop / R / fees වෙනස් කරලා ආයෙත් run කරන එක ඉක්මනයි.
 - **අවවාදය**: coins ගොඩකින් හොඳම ඒවා තෝරද්දී සමහර ඒවා හුදෙක් වාසනාවට හොඳ පෙනෙන්න පුළුවන්. මේ ලැයිස්තුව candidates විතරයි, ඒවා වෙනම backtest කරලා (වැඩි කාලයක් / වෙනස් candle size එකකින්) තහවුරු කරන්න. අතීත ප්‍රතිඵල අනාගතය සහතික කරන්නේ නැහැ.
 
