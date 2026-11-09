@@ -56,7 +56,7 @@ ul{margin:4px 0;padding-left:20px}
 <div><label>Exit</label><input id="exit" inputmode="decimal"></div>
 <div><label>Stop loss</label><input id="sl" inputmode="decimal"></div>
 <div><label>PnL</label><input id="pnl" inputmode="decimal"></div>
-<div><label>Result</label><select id="res"><option>win</option><option>loss</option><option>open</option></select></div>
+<div><label>Result</label><select id="res"><option>open</option><option>win</option><option>loss</option></select></div>
 <div><label>Strategy</label><input id="strat"></div>
 </div>
 <label>වැරදි (කොමා වලින් වෙන් කරන්න)</label><input id="mist">
@@ -68,7 +68,7 @@ ul{margin:4px 0;padding-left:20px}
 
 <section id="list">
 <div class="box g">
-<div><label>Result</label><select id="fr"><option value="">සියල්ල</option><option>win</option><option>loss</option><option>open</option></select></div>
+<div><label>Result</label><select id="fr"><option value="">සියල්ල</option><option>open</option><option>win</option><option>loss</option></select></div>
 <div><label>Strategy</label><select id="fs"><option value="">සියල්ල</option></select></div>
 </div>
 <div id="items"></div>
@@ -109,8 +109,16 @@ function parse(t){
  o.entry=g(/(?:entry|enter)[^\d\n]{0,15}([\d.,]+)/i);
  o.exit=g(/(?:exit|close[d]?|take profit|tp|target)[^\d\n]{0,15}([\d.,]+)/i);
  o.sl=g(/(?:stop loss|stop|sl)[^\d\n]{0,15}([\d.,]+)/i);
- o.pnl=g(/(?:pnl|p&l|profit|loss)[^\d\n-]{0,10}([+-]?[\d.,]+)/i);
- if(/\b(win|won|profit|tp hit)\b/i.test(t))o.res="win";else if(/\b(loss|lost|sl hit|stopped)\b/i.test(t))o.res="loss";else o.res="open";
+ var cl=t.replace(/stop[\s-]?loss/ig,"sl").replace(/take[\s-]?profit/ig,"tp");
+ var pm=cl.match(/(pnl|p&l|profit|loss)[^\d\n-]{0,10}([+-]?\d[\d.,]*)/i),pv="";
+ if(pm){pv=pm[2].replace(/,/g,"");if(/loss/i.test(pm[1])&&pv.charAt(0)!=="-")pv="-"+pv}
+ o.pnl=pv;
+ var lb=cl.match(/result\s*[:\-]?\s*(win|won|profit|loss|lost|open)/i);
+ if(lb)o.res=/win|won|profit/i.test(lb[1])?"win":/open/i.test(lb[1])?"open":"loss";
+ else if(pv&&parseFloat(pv)<0)o.res="loss";
+ else if(/\b(lost|loss|losses|sl hit|stopped out|stopped|පාඩු)/i.test(cl))o.res="loss";
+ else if(/\b(won|win|winner|tp hit|target hit|profit)\b|ලාභ/i.test(cl))o.res="win";
+ else o.res="open";
  function l(r){var m=t.match(r);return m?m[1].trim():""}
  o.strat=l(/strategy\s*[:\-]\s*([^\n.]+)/i);
  o.mist=l(/mistakes?\s*[:\-]\s*([^\n]+)/i);
@@ -125,7 +133,7 @@ $("save").onclick=function(){
  if(!$("symbol").value.trim()){$("msg").textContent="Symbol එක අවශ්‍යයි.";return}
  D.unshift({id:Date.now(),date:new Date().toISOString().slice(0,10),raw:$("raw").value,symbol:$("symbol").value.trim().toUpperCase(),dir:$("dir").value,entry:$("entry").value,exit:$("exit").value,sl:$("sl").value,pnl:parseFloat($("pnl").value)||0,res:$("res").value,strat:$("strat").value.trim().toLowerCase(),mist:$("mist").value,less:$("less").value});
  store();["raw","symbol","entry","exit","sl","pnl","strat","mist","less"].forEach(function(i){$(i).value=""});
- $("msg").textContent="Save කළා."};
+ $("res").value="open";$("msg").textContent="Save කළා."};
 
 function render(){
  var fs=$("fs"),cur=fs.value,ss={};
