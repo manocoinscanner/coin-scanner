@@ -1,1 +1,168 @@
+<!DOCTYPE html>
+<html lang="si">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trading Journal</title>
+<style>
+:root{--bg:#eef1ec;--card:#fbfcfa;--tx:#1b2420;--mu:#5d6b64;--bd:#d5dcd5;--ac:#1f5f4a;--acx:#fff;--rd:#b3261e;--gr:#13734f}
+@media (prefers-color-scheme:dark){:root{--bg:#10171a;--card:#182125;--tx:#e6ece8;--mu:#93a39b;--bd:#2b3a3f;--ac:#5fd0a8;--acx:#06251a;--rd:#ff8a80;--gr:#6fe0b0}}
+*{box-sizing:border-box}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.6 "Noto Sans Sinhala","Iskoola Pota",Georgia,"Times New Roman",serif;padding:env(safe-area-inset-top,0px) 0 env(safe-area-inset-bottom,0px)}
+main{max-width:760px;margin:0 auto;padding:16px}
+h1{font-size:1.5rem;margin:8px 0 12px}
+h2{font-size:1.1rem;margin:0 0 8px}
+nav{display:flex;gap:6px;margin-bottom:14px}
+nav button{flex:1;padding:10px 6px;border:1px solid var(--bd);background:var(--card);color:var(--tx);border-radius:8px;font:inherit}
+nav button.on{background:var(--ac);color:var(--acx);border-color:var(--ac)}
+section{display:none}section.on{display:block}
+.box{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:14px;margin-bottom:12px}
+textarea,input,select{width:100%;padding:9px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);color:var(--tx);font:inherit}
+textarea{min-height:110px}
+label{display:block;font-size:.85rem;color:var(--mu);margin:8px 0 3px}
+.g{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.b{padding:10px 14px;border:0;border-radius:8px;background:var(--ac);color:var(--acx);font:inherit;margin:8px 6px 0 0}
+.b.s{background:transparent;color:var(--tx);border:1px solid var(--bd)}
+.win{color:var(--gr)}.loss{color:var(--rd)}.mu{color:var(--mu);font-size:.9rem}
+.t{border-left:4px solid var(--bd);padding-left:10px}
+.t.win{border-color:var(--gr)}.t.loss{border-color:var(--rd)}
+ul{margin:4px 0;padding-left:20px}
+:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+</style>
+</head>
+<body>
+<main>
+<h1>මගේ Trading Journal</h1>
+<nav>
+<button data-v="add" class="on">අලුත් trade</button>
+<button data-v="list">Journal</button>
+<button data-v="coach">Coach</button>
+</nav>
 
+<section id="add" class="on">
+<div class="box">
+<h2>Report එක paste කරන්න</h2>
+<p class="mu">උදා: "BTCUSDT long, entry 64000, sl 63500, exit 65200, win. Strategy: breakout. Mistake: late entry. Lesson: wait for retest"</p>
+<textarea id="raw"></textarea>
+<button class="b" id="parse">Fields වලට වෙන් කරන්න</button>
+</div>
+<div class="box">
+<h2>Trade විස්තර (වෙනස් කරන්න පුළුවන්)</h2>
+<div class="g">
+<div><label>Symbol</label><input id="symbol"></div>
+<div><label>Direction</label><select id="dir"><option>long</option><option>short</option></select></div>
+<div><label>Entry</label><input id="entry" inputmode="decimal"></div>
+<div><label>Exit</label><input id="exit" inputmode="decimal"></div>
+<div><label>Stop loss</label><input id="sl" inputmode="decimal"></div>
+<div><label>PnL</label><input id="pnl" inputmode="decimal"></div>
+<div><label>Result</label><select id="res"><option>win</option><option>loss</option><option>open</option></select></div>
+<div><label>Strategy</label><input id="strat"></div>
+</div>
+<label>වැරදි (කොමා වලින් වෙන් කරන්න)</label><input id="mist">
+<label>පාඩම් (කොමා වලින් වෙන් කරන්න)</label><input id="less">
+<button class="b" id="save">Trade එක save කරන්න</button>
+<span id="msg" class="mu"></span>
+</div>
+</section>
+
+<section id="list">
+<div class="box g">
+<div><label>Result</label><select id="fr"><option value="">සියල්ල</option><option>win</option><option>loss</option><option>open</option></select></div>
+<div><label>Strategy</label><select id="fs"><option value="">සියල්ල</option></select></div>
+</div>
+<div id="items"></div>
+</section>
+
+<section id="coach">
+<div class="box">
+<button class="b" data-c="sum">Summary</button>
+<button class="b" data-c="weak">Weak points</button>
+<button class="b" data-c="check">Trade එකට කලින් checklist</button>
+<button class="b" data-c="dd">කරන්න / කරන්න එපා</button>
+</div>
+<div class="box" id="out"><p class="mu">ඉහත button එකක් එබුවම ඔයාගේ journal එක අනුව විශ්ලේෂණය මෙතන පෙනේ.</p></div>
+<div class="box">
+<h2>Backup</h2>
+<p class="mu">Data තියෙන්නේ මේ tablet එකේ browser එකේ. Browser data මැකුවොත් නැති වෙනවා. නිතර backup එකක් ගන්න.</p>
+<button class="b s" id="exp">Backup බාගන්න</button>
+<label>Backup file එක ආපසු දාන්න</label><input type="file" id="imp" accept=".json">
+</div>
+</section>
+</main>
+<script>
+var K="tj_trades",D=[];
+try{D=JSON.parse(localStorage.getItem(K)||"[]")}catch(e){D=[]}
+function store(){try{localStorage.setItem(K,JSON.stringify(D))}catch(e){alert("Save කරන්න බැරි වුණා")}}
+function $(i){return document.getElementById(i)}
+function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]})}
+function tags(s){return String(s||"").split(",").map(function(x){return x.trim().toLowerCase()}).filter(Boolean)}
+function show(v){document.querySelectorAll("section").forEach(function(s){s.classList.toggle("on",s.id===v)});document.querySelectorAll("nav button").forEach(function(b){b.classList.toggle("on",b.dataset.v===v)});if(v==="list")render()}
+document.querySelectorAll("nav button").forEach(function(b){b.onclick=function(){show(b.dataset.v)}});
+
+function parse(t){
+ var o={},stop="LONG SHORT BUY SELL ENTRY EXIT STOP LOSS WIN TP SL PNL TRADE STRATEGY MISTAKE LESSON PROFIT TARGET CLOSE";
+ (t.match(/\b[A-Za-z]{3,10}(?:\/?USDT)?\b/g)||[]).some(function(w){if(w===w.toUpperCase()&&stop.indexOf(w)<0){o.symbol=w;return true}});
+ if(!o.symbol){var c=t.match(/\b(btc|eth|sol|xrp|bnb|doge|ada)\w*/i);if(c)o.symbol=c[0].toUpperCase()}
+ if(/\b(short|sell)\b/i.test(t))o.dir="short";else if(/\b(long|buy)\b/i.test(t))o.dir="long";
+ function g(r){var m=t.match(r);return m?m[1].replace(/,/g,""):""}
+ o.entry=g(/(?:entry|enter)[^\d\n]{0,15}([\d.,]+)/i);
+ o.exit=g(/(?:exit|close[d]?|take profit|tp|target)[^\d\n]{0,15}([\d.,]+)/i);
+ o.sl=g(/(?:stop loss|stop|sl)[^\d\n]{0,15}([\d.,]+)/i);
+ o.pnl=g(/(?:pnl|p&l|profit|loss)[^\d\n-]{0,10}([+-]?[\d.,]+)/i);
+ if(/\b(win|won|profit|tp hit)\b/i.test(t))o.res="win";else if(/\b(loss|lost|sl hit|stopped)\b/i.test(t))o.res="loss";else o.res="open";
+ function l(r){var m=t.match(r);return m?m[1].trim():""}
+ o.strat=l(/strategy\s*[:\-]\s*([^\n.]+)/i);
+ o.mist=l(/mistakes?\s*[:\-]\s*([^\n]+)/i);
+ o.less=l(/lessons?\s*[:\-]\s*([^\n]+)/i);
+ return o}
+$("parse").onclick=function(){
+ var o=parse($("raw").value);
+ $("symbol").value=o.symbol||"";$("dir").value=o.dir||"long";$("entry").value=o.entry;$("exit").value=o.exit;$("sl").value=o.sl;
+ $("pnl").value=o.pnl;$("res").value=o.res;$("strat").value=o.strat;$("mist").value=o.mist;$("less").value=o.less;
+ $("msg").textContent="පරීක්ෂා කරලා වෙනස් කරන්න, ඊට පස්සේ save කරන්න."};
+$("save").onclick=function(){
+ if(!$("symbol").value.trim()){$("msg").textContent="Symbol එක අවශ්‍යයි.";return}
+ D.unshift({id:Date.now(),date:new Date().toISOString().slice(0,10),raw:$("raw").value,symbol:$("symbol").value.trim().toUpperCase(),dir:$("dir").value,entry:$("entry").value,exit:$("exit").value,sl:$("sl").value,pnl:parseFloat($("pnl").value)||0,res:$("res").value,strat:$("strat").value.trim().toLowerCase(),mist:$("mist").value,less:$("less").value});
+ store();["raw","symbol","entry","exit","sl","pnl","strat","mist","less"].forEach(function(i){$(i).value=""});
+ $("msg").textContent="Save කළා."};
+
+function render(){
+ var fs=$("fs"),cur=fs.value,ss={};
+ D.forEach(function(t){if(t.strat)ss[t.strat]=1});
+ fs.innerHTML='<option value="">සියල්ල</option>'+Object.keys(ss).map(function(s){return"<option>"+esc(s)+"</option>"}).join("");fs.value=cur;
+ var h=D.filter(function(t){return(!$("fr").value||t.res===$("fr").value)&&(!fs.value||t.strat===fs.value)}).map(function(t){
+  return'<div class="box t '+t.res+'"><b>'+esc(t.symbol)+"</b> "+esc(t.dir)+' <span class="'+t.res+'">'+t.res+" "+(t.pnl||"")+'</span> <span class="mu">'+t.date+"</span>"
+  +'<div class="mu">Entry '+esc(t.entry)+" / Exit "+esc(t.exit)+" / SL "+esc(t.sl)+(t.strat?" / "+esc(t.strat):"")+"</div>"
+  +(t.mist?"<div>වැරදි: "+esc(t.mist)+"</div>":"")+(t.less?"<div>පාඩම්: "+esc(t.less)+"</div>":"")
+  +'<button class="b s" onclick="del('+t.id+')">මකන්න</button></div>'}).join("");
+ $("items").innerHTML=h||'<p class="mu">තවම trades නැහැ. "අලුත් trade" tab එකෙන් එකක් දාන්න.</p>'}
+$("fr").onchange=render;$("fs").onchange=render;
+function del(id){if(confirm("මේ trade එක මකන්නද?")){D=D.filter(function(t){return t.id!==id});store();render()}}
+
+function count(list){var m={};list.forEach(function(t){tags(t).forEach(function(x){m[x]=(m[x]||0)+1})});return Object.keys(m).map(function(k){return[k,m[k]]}).sort(function(a,b){return b[1]-a[1]})}
+function rate(a){var c=a.filter(function(t){return t.res!=="open"});return c.length?Math.round(100*c.filter(function(t){return t.res==="win"}).length/c.length):null}
+function coach(k){
+ if(!D.length)return'<p class="mu">මුලින්ම trades කිහිපයක් save කරන්න.</p>';
+ var closed=D.filter(function(t){return t.res!=="open"}),w=rate(D),pnl=D.reduce(function(s,t){return s+(t.pnl||0)},0);
+ var mAll=count(D.map(function(t){return t.mist})),mLoss=count(D.filter(function(t){return t.res==="loss"}).map(function(t){return t.mist}));
+ var lAll=count(D.map(function(t){return t.less}));
+ var st={};D.forEach(function(t){if(t.strat){(st[t.strat]=st[t.strat]||[]).push(t)}});
+ var weakS=Object.keys(st).filter(function(s){var r=rate(st[s]);return st[s].length>=2&&r!==null&&r<50});
+ function li(a,f){return"<ul>"+a.map(f).join("")+"</ul>"}
+ if(k==="sum")return"<h2>Summary</h2><p>Trades "+D.length+" ("+closed.length+" වසා ඇත). Win rate "+(w===null?"-":w+"%")+". මුළු PnL "+pnl.toFixed(2)+".</p>"
+  +(Object.keys(st).length?"<p>Strategy අනුව:</p>"+li(Object.keys(st),function(s){return"<li>"+esc(s)+": "+(rate(st[s])===null?"-":rate(st[s])+"%")+" ("+st[s].length+")</li>"}):"")
+  +(mAll[0]?"<p>වැඩියෙන්ම නැවත නැවත වන වැරද්ද: <b>"+esc(mAll[0][0])+"</b> ("+mAll[0][1]+" වතාවක්).</p>":"");
+ if(k==="weak")return"<h2>Weak points</h2>"+(mLoss.length?"<p>පාඩු trades වල නිතර එන වැරදි:</p>"+li(mLoss.slice(0,5),function(x){return"<li>"+esc(x[0])+" ("+x[1]+")</li>"}):'<p class="mu">පාඩු trades වල වැරදි තවම සටහන් කරලා නැහැ.</p>')
+  +(weakS.length?"<p>Win rate 50% ට අඩු strategies:</p>"+li(weakS,function(s){return"<li>"+esc(s)+" ("+rate(st[s])+"%)</li>"}):"");
+ if(k==="check")return"<h2>Trade එකක් ගන්න කලින්</h2>"+li(mAll.slice(0,5),function(x){return"<li>මම \""+esc(x[0])+"\" නැවත කරනවාද? නැහැ කියලා තහවුරු කරන්න.</li>"})
+  +li(lAll.slice(0,5),function(x){return"<li>"+esc(x[0])+"</li>"})+"<ul><li>Entry, Stop loss, Target කලින් ලියා තිබේද?</li><li>Risk එක මගේ සීමාවට ඇතුළත්ද?</li></ul>";
+ if(k==="dd")return"<h2>කරන්න එපා</h2>"+(mAll.length?li(mAll.slice(0,5),function(x){return"<li>"+esc(x[0])+" ("+x[1]+")</li>"}):'<p class="mu">-</p>')
+  +"<h2>කරන්න</h2>"+(lAll.length?li(lAll.slice(0,5),function(x){return"<li>"+esc(x[0])+" ("+x[1]+")</li>"}):'<p class="mu">-</p>')}
+document.querySelectorAll("[data-c]").forEach(function(b){b.onclick=function(){$("out").innerHTML=coach(b.dataset.c)}});
+
+$("exp").onclick=function(){var a=document.createElement("a");a.href=URL.createObjectURL(new Blob([JSON.stringify(D)],{type:"application/json"}));a.download="trading-journal-backup.json";a.click()};
+$("imp").onchange=function(e){var f=e.target.files[0];if(!f)return;var r=new FileReader();r.onload=function(){try{var x=JSON.parse(r.result);if(Array.isArray(x)){D=x;store();alert("Backup එක ආපසු දැම්මා")}}catch(err){alert("File එක වැරදියි")}};r.readAsText(f)};
+</script>
+</body>
+</html>
